@@ -21,6 +21,9 @@ pub(crate) type CredentialCallback = dyn Fn(&str) -> Option<Credentials> + Send 
 
 #[derive(Default)]
 struct AuthState {
+    /// The remote's URL as libgit2 gave it, without userinfo. Credentials are
+    /// only ever sent to its origin (scheme, host and port).
+    start: Option<Url>,
     /// Base URL of the repository, updated when info/refs is redirected.
     base: Option<String>,
     /// Credentials that the server accepted, reused for the POST requests.
@@ -29,16 +32,24 @@ struct AuthState {
 
 /// One subtransport per remote, created by the factory in `lib.rs`.
 pub(crate) struct Subtransport {
+    /// Built by `register` with redirects off, so every redirect reaches
+    /// `advertise` or `RpcStream::read`.
     client: Client,
     callback: Arc<CredentialCallback>,
+    max_request_body: usize,
     state: Mutex<AuthState>,
 }
 
 impl Subtransport {
-    pub(crate) fn new(client: Client, callback: Arc<CredentialCallback>) -> Self {
+    pub(crate) fn new(
+        client: Client,
+        callback: Arc<CredentialCallback>,
+        max_request_body: usize,
+    ) -> Self {
         Self {
             client,
             callback,
+            max_request_body,
             state: Mutex::new(AuthState::default()),
         }
     }
@@ -64,20 +75,33 @@ impl Subtransport {
             }
             parsed = without_userinfo(&parsed);
         }
+        state.start = Some(parsed.clone());
         Ok(parsed.as_str().trim_end_matches('/').to_owned())
     }
 
-    fn accepted_credentials(&self) -> Option<Credentials> {
-        self.state().accepted.clone()
+    /// Whether `url` has the remote's own origin. Only then may credentials
+    /// be sent or the callback be asked for them.
+    fn is_start_origin(&self, url: &Url) -> bool {
+        self.state()
+            .start
+            .as_ref()
+            .is_some_and(|start| start.origin() == url.origin())
+    }
+
+    /// Accepted credentials, if `url` is on the remote's own origin.
+    fn credentials_for(&self, url: &Url) -> Option<Credentials> {
+        if self.is_start_origin(url) {
+            self.state().accepted.clone()
+        } else {
+            None
+        }
     }
 
     fn advertise(&self, url: &str, service: &str) -> Result<Stream, Error> {
         let base = self.base_for(url)?;
         let mut target = parse_url(&format!("{base}/info/refs?service={service}"))?;
         let mut response = self.get_authenticated(&target)?;
-        // Redirects are followed only here. A client built with
-        // `Policy::none()` shows them to us; otherwise reqwest already followed
-        // them and `response.url()` carries the final location.
+        // Redirects are followed only here: the client never follows them.
         for _ in 0..MAX_REDIRECTS {
             if !response.status().is_redirection() {
                 break;
@@ -91,16 +115,13 @@ impl Subtransport {
             let next = target
                 .join(&location)
                 .map_err(|e| Error::from_str(&format!("https transport: bad redirect: {e}")))?;
-            self.check_redirect(&target, &next)?;
+            check_redirect(&next)?;
             target = next;
             response = self.get_authenticated(&target)?;
         }
         if response.status().is_redirection() {
             return Err(Error::from_str("https transport: too many redirects"));
         }
-        // A client that follows redirects itself may have ended elsewhere.
-        let final_url = response.url().clone();
-        self.check_redirect(&target, &final_url)?;
         if !response.status().is_success() {
             return Err(Error::from_str(&http_error(response.status(), &target)));
         }
@@ -109,26 +130,20 @@ impl Subtransport {
         Ok(Stream::Advertisement(response))
     }
 
-    /// Refuses a redirect off https, and forgets accepted credentials when the
-    /// redirect leaves the origin (scheme, host or port), so they are not sent
-    /// to another server.
-    fn check_redirect(&self, from: &Url, to: &Url) -> Result<(), Error> {
-        if to.scheme() != "https" {
-            return Err(Error::from_str(&format!(
-                "https transport: redirect to non-https URL {} refused",
-                redact(to)
-            )));
-        }
-        if to.origin() != from.origin() {
-            self.state().accepted = None;
-        }
-        Ok(())
-    }
-
+    /// GET with the accepted credentials. On a 401 at the remote's own origin,
+    /// asks the callback and retries once. A 401 at any other origin (reached
+    /// by a redirect) fails without asking: credentials never leave the origin.
     fn get_authenticated(&self, url: &Url) -> Result<Response, Error> {
-        let response = self.get(url, self.accepted_credentials().as_ref())?;
+        let response = self.get(url, self.credentials_for(url).as_ref())?;
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
+        }
+        if !self.is_start_origin(url) {
+            return Err(Error::from_str(&format!(
+                "https transport: HTTP 401 from {} after a redirect to another origin; \
+                 credentials are only sent to the remote's own origin",
+                redact(url)
+            )));
         }
         let credentials = (self.callback)(url.as_str()).ok_or_else(|| {
             Error::from_str("https transport: 401 and the credential callback gave no credentials")
@@ -159,13 +174,14 @@ impl Subtransport {
             .header(USER_AGENT, USER_AGENT_VALUE)
             .header(CONTENT_TYPE, format!("application/x-{service}-request"))
             .header(ACCEPT, format!("application/x-{service}-result"));
-        if let Some(c) = self.accepted_credentials() {
+        if let Some(c) = self.credentials_for(&target) {
             request = request.basic_auth(c.username, Some(c.password));
         }
 
         Ok(Stream::Rpc(Box::new(RpcStream {
             request: Some(request),
             body: Vec::new(),
+            max_body: self.max_request_body,
             response: None,
             target,
             result_type: format!("application/x-{service}-result"),
@@ -227,12 +243,13 @@ impl Write for Stream {
 }
 
 /// The request body is buffered and sent with a `Content-Length` on the first
-/// read. A stateless-RPC body is one negotiation round or one pack, so it is
-/// bounded by the pack size.
+/// read. A stateless-RPC body is one negotiation round or one pack, so a push
+/// holds its whole pack in memory, up to `max_body` bytes.
 pub(crate) struct RpcStream {
     /// The POST, until it is sent.
     request: Option<RequestBuilder>,
     body: Vec<u8>,
+    max_body: usize,
     response: Option<Response>,
     target: Url,
     result_type: String,
@@ -245,6 +262,16 @@ impl Write for RpcStream {
                 io::ErrorKind::BrokenPipe,
                 "request body already sent",
             ));
+        }
+        if buf.len() > self.max_body.saturating_sub(self.body.len()) {
+            // Drop the request so nothing partial is ever sent.
+            self.request = None;
+            self.body = Vec::new();
+            return Err(io::Error::other(format!(
+                "https transport: request body exceeds the {}-byte limit \
+                 (max_request_body in register)",
+                self.max_body
+            )));
         }
         self.body.extend_from_slice(buf);
         Ok(buf.len())
@@ -265,8 +292,8 @@ impl Read for RpcStream {
             let response = request
                 .body(mem::take(&mut self.body))
                 .send()
-                .map_err(io::Error::other)?;
-            if response.url() != &self.target || response.status().is_redirection() {
+                .map_err(|e| io::Error::other(network_error(e).message().to_owned()))?;
+            if response.status().is_redirection() {
                 return Err(io::Error::other(
                     "https transport: redirect on POST refused (only info/refs is followed)",
                 ));
@@ -303,14 +330,14 @@ fn redact(url: &Url) -> String {
     without_userinfo(url).to_string()
 }
 
-/// `redact` for text that did not parse as a URL: drops the authority up to
-/// its last `@`.
+/// `redact` for text that did not parse as a URL: drops everything after
+/// `://` up to the last `@`. A password may hold an unencoded `/`, so the
+/// authority's end cannot be trusted; this may over-redact a path with `@`.
 fn redact_raw(raw: &str) -> String {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return raw.to_owned();
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
+    match rest.rfind('@') {
         Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
         None => raw.to_owned(),
     }
@@ -356,7 +383,23 @@ fn http_error(status: StatusCode, url: &Url) -> String {
     format!("https transport: HTTP {status} from {}", redact(url))
 }
 
-fn network_error(error: reqwest::Error) -> Error {
+/// Refuses a redirect off https. (The client is also `https_only`.)
+fn check_redirect(to: &Url) -> Result<(), Error> {
+    if to.scheme() == "https" {
+        Ok(())
+    } else {
+        Err(Error::from_str(&format!(
+            "https transport: redirect to non-https URL {} refused",
+            redact(to)
+        )))
+    }
+}
+
+fn network_error(mut error: reqwest::Error) -> Error {
+    // reqwest drops userinfo from request URLs today; do not rely on it.
+    if let Some(url) = error.url_mut() {
+        *url = without_userinfo(url);
+    }
     Error::from_str(&format!("https transport: {error}"))
 }
 
@@ -378,5 +421,25 @@ mod tests {
         let err = parse_url("https://alice:hunter2@exa mple.com/repo.git").unwrap_err();
         assert!(!err.message().contains("hunter2"), "{}", err.message());
         assert!(err.message().contains("bad URL"), "{}", err.message());
+    }
+
+    #[test]
+    fn parse_url_error_redacts_password_with_slash() {
+        let err = parse_url("https://alice:pa/ss@example.com/repo.git").unwrap_err();
+        assert!(!err.message().contains("pa/ss"), "{}", err.message());
+        assert!(!err.message().contains("alice"), "{}", err.message());
+    }
+
+    #[test]
+    fn network_error_redacts_userinfo() {
+        let client = Client::builder().https_only(true).build().unwrap();
+        let error = client
+            .get("http://alice:hunter2@127.0.0.1:1/repo.git")
+            .send()
+            .unwrap_err();
+        assert!(error.url().is_some(), "error carries no URL: {error}");
+        let text = network_error(error).message().to_owned();
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("alice"), "{text}");
     }
 }

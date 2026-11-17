@@ -30,6 +30,8 @@ struct Shared {
     unauthorized: AtomicUsize,
     seen: Mutex<Vec<Seen>>,
     port: u16,
+    /// A second listener on the same host, for port-only origin changes.
+    alt_port: u16,
 }
 
 /// What the server saw for one request.
@@ -45,7 +47,7 @@ pub struct Seen {
 
 pub struct Fixture {
     origin: String,
-    client: reqwest::blocking::Client,
+    cert_pem: String,
     shared: Arc<Shared>,
     _root_dir: tempfile::TempDir,
 }
@@ -75,6 +77,8 @@ pub fn fixture() -> &'static Fixture {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local addr").port();
+        let alt_listener = TcpListener::bind("127.0.0.1:0").expect("bind alt");
+        let alt_port = alt_listener.local_addr().expect("alt local addr").port();
         let root_dir = tempfile::tempdir().expect("temp root");
         let shared = Arc::new(Shared {
             root: root_dir.path().to_path_buf(),
@@ -82,30 +86,24 @@ pub fn fixture() -> &'static Fixture {
             unauthorized: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
             port,
+            alt_port,
         });
 
-        let accept_shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let config = Arc::clone(&server_config);
-                let shared = Arc::clone(&accept_shared);
-                thread::spawn(move || serve_connection(stream, config, &shared));
-            }
-        });
-
-        // Trust the self-signed certificate. Never follow redirects in the client:
-        // the transport follows info/refs redirects itself.
-        let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .add_root_certificate(
-                reqwest::Certificate::from_pem(cert.cert.pem().as_bytes()).expect("cert pem"),
-            )
-            .build()
-            .expect("reqwest client");
+        for listener in [listener, alt_listener] {
+            let accept_shared = Arc::clone(&shared);
+            let server_config = Arc::clone(&server_config);
+            thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let config = Arc::clone(&server_config);
+                    let shared = Arc::clone(&accept_shared);
+                    thread::spawn(move || serve_connection(stream, config, &shared));
+                }
+            });
+        }
 
         Fixture {
             origin: format!("https://localhost:{port}"),
-            client,
+            cert_pem: cert.cert.pem(),
             shared,
             _root_dir: root_dir,
         }
@@ -117,8 +115,13 @@ impl Fixture {
         format!("{}/{path}", self.origin)
     }
 
-    pub fn client(&self) -> reqwest::blocking::Client {
-        self.client.clone()
+    /// A client builder that trusts the self-signed certificate. It keeps
+    /// reqwest's default (following) redirect policy, so the tests show that
+    /// the transport overrides it.
+    pub fn builder(&self) -> reqwest::blocking::ClientBuilder {
+        reqwest::blocking::Client::builder().add_root_certificate(
+            reqwest::Certificate::from_pem(self.cert_pem.as_bytes()).expect("cert pem"),
+        )
     }
 
     pub fn root(&self) -> &Path {
@@ -149,16 +152,27 @@ impl Fixture {
 /// Registers the transport once per process. The callback supplies credentials
 /// only for the test paths that need them.
 pub fn register_once() {
+    register_once_with_limit(git2_rustls_transport::DEFAULT_MAX_REQUEST_BODY);
+}
+
+/// `register_once` with a request-body cap. Registration is process-global,
+/// so a test binary uses one limit for all its tests.
+pub fn register_once_with_limit(max_request_body: usize) {
     REGISTER.call_once(|| {
         // SAFETY: `Once` serialises registration, and no test creates a
         // transport before `register_once` returns.
-        unsafe { git2_rustls_transport::register(fixture().client(), callback) }
-            .expect("register https transport");
+        unsafe {
+            git2_rustls_transport::register(fixture().builder(), max_request_body, callback)
+        }
+        .expect("register https transport");
     });
 }
 
 fn callback(url: &str) -> Option<Credentials> {
-    let password = if url.contains("/private/") || url.contains("/xhost/") {
+    let password = if ["/private/", "/xhost/", "/xport/", "/xpost/"]
+        .iter()
+        .any(|p| url.contains(p))
+    {
         PASSWORD
     } else if url.contains("/badauth/") {
         "wrong"
@@ -409,6 +423,36 @@ fn route(request: &Req, shared: &Shared) -> Reply {
             return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
         }
         let location = format!("https://127.0.0.1:{}/leak{}", shared.port, with_query(rest));
+        return redirect(301, &location);
+    }
+    // /xport/<repo>: needs auth, then redirects info/refs to the same host on
+    // another port, under /leak.
+    if let Some(rest) = path.strip_prefix("/xport") {
+        if request.header("Authorization") != Some(expected_auth().as_str()) {
+            shared.unauthorized.fetch_add(1, Ordering::SeqCst);
+            return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
+        }
+        let location = format!("https://localhost:{}/leak{}", shared.alt_port, with_query(rest));
+        return redirect(301, &location);
+    }
+    // /xpost/<repo>: GETs need auth and are served; POSTs get a 307 to another
+    // host under /leak (the body must never get there).
+    if let Some(rest) = path.strip_prefix("/xpost") {
+        if is_post {
+            let location = format!("https://127.0.0.1:{}/leak{}", shared.port, with_query(rest));
+            return redirect(307, &location);
+        }
+        if request.header("Authorization") != Some(expected_auth().as_str()) {
+            shared.unauthorized.fetch_add(1, Ordering::SeqCst);
+            return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
+        }
+        let content_type = request.header("Content-Type");
+        return run_cgi(&shared.root, rest, &request.method, query, content_type, Some(USER), &request.body);
+    }
+    // /xauth/<repo>: redirects info/refs, with no auth, to /private on another
+    // host. The 401 there must not reach the credential callback.
+    if let Some(rest) = path.strip_prefix("/xauth") {
+        let location = format!("https://127.0.0.1:{}/private{}", shared.port, with_query(rest));
         return redirect(301, &location);
     }
     // /tohttp/<repo>: redirects info/refs to plain http.

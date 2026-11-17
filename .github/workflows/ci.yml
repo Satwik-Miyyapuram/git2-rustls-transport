@@ -21,6 +21,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
 
+  msrv:
+    name: test (msrv 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
   android:
     name: build (android ${{ matrix.target }})
     runs-on: ubuntu-latest
@@ -38,9 +47,9 @@ jobs:
         id: ndk
         with:
           ndk-version: r27c
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
-          tool: cargo-ndk
+          tool: cargo-ndk@4.1.2
       - run: cargo ndk -t ${{ matrix.target }} build --lib
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}

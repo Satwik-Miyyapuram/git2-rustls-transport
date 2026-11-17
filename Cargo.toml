@@ -2,7 +2,9 @@
 name = "git2-rustls-transport"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
+# MSRV-aware dependency resolution (Cargo.lock is not committed).
+resolver = "3"
 license = "MIT OR Apache-2.0"
 description = "git2 smart-HTTP transport for libgit2 over blocking reqwest + rustls (no OpenSSL)"
 repository = "https://github.com/Satwik-Miyyapuram/git2-rustls-transport"

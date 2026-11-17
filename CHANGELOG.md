@@ -10,12 +10,18 @@
 - `register` is `unsafe`: it must not race with git2 transport creation.
 - Credentials in the remote URL (`https://user:token@host/repo`) are used and
   stripped from the request URL.
-- On 401, calls the caller's credential callback and retries once with basic
-  auth. Accepted credentials are reused for later POSTs on the same transport.
-  libgit2's `RemoteCallbacks::credentials` is not consulted.
-- Follows redirects on info/refs only. A redirect on a POST or to a non-https
-  URL is refused, and credentials are dropped when a redirect changes scheme,
-  host or port.
+- On 401 at the remote's own origin, calls the caller's credential callback
+  and retries once with basic auth. Accepted credentials are reused for later
+  POSTs on the same transport. libgit2's `RemoteCallbacks::credentials` is not
+  consulted.
+- Credentials are only sent to the remote URL's origin (scheme, host, port).
+  A 401 after a redirect to another origin fails without calling the
+  callback.
+- `register` takes a `reqwest::blocking::ClientBuilder` (TLS roots, proxy and
+  timeouts are the caller's choice) and builds it with `reqwest` redirects off
+  and `https_only(true)`. The transport follows info/refs redirects itself; a
+  redirect on a POST or to a non-https URL is refused.
+- `register` takes `max_request_body`, a cap on one buffered POST body (a
+  push's whole pack); `DEFAULT_MAX_REQUEST_BODY` is 256 MiB.
 - Error messages never include the URL's username or password.
-- The caller builds the `reqwest::blocking::Client` (TLS roots and proxy are
-  the caller's choice).
+- Minimum supported Rust version: 1.88.

@@ -176,3 +176,38 @@ fn post_bodies_carry_content_length() {
     assert!(!posts.is_empty(), "no POST seen");
     assert!(posts.iter().all(|s| s.content_length && !s.chunked), "{posts:?}");
 }
+
+#[test]
+fn port_only_redirect_drops_credentials() {
+    register_once();
+    let fx = fixture();
+    seed("xpt.git");
+    let (dir, _repo) = clone(&fx.url("xport/xpt.git")).expect("clone through port-change redirect");
+    assert!(dir.path().join("README.md").is_file());
+    let leaked = fx.seen("/leak/xpt.git");
+    assert!(!leaked.is_empty(), "redirect target never reached");
+    assert!(leaked.iter().all(|s| !s.authorization), "credentials sent to another port: {leaked:?}");
+}
+
+#[test]
+fn post_redirect_to_another_origin_never_delivers_the_body() {
+    register_once();
+    let fx = fixture();
+    seed("xp.git");
+    let err = clone(&fx.url("xpost/xp.git")).err().expect("POST redirect must be refused");
+    assert!(err.message().contains("redirect"), "got: {err}");
+    let leaked = fx.seen("/leak/xp.git");
+    assert!(leaked.is_empty(), "POST followed to another origin: {leaked:?}");
+}
+
+#[test]
+fn auth_at_a_redirected_origin_never_calls_the_callback() {
+    register_once();
+    let fx = fixture();
+    seed("xa.git");
+    let err = clone(&fx.url("xauth/xa.git")).err().expect("401 at another origin must fail");
+    assert!(err.message().contains("origin"), "got: {err}");
+    let there = fx.seen("/private/xa.git");
+    assert!(!there.is_empty(), "redirect target never reached");
+    assert!(there.iter().all(|s| !s.authorization), "credentials sent to another origin: {there:?}");
+}

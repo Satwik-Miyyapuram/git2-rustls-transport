@@ -9,23 +9,21 @@ useful on Android, where OpenSSL is awkward to build.
 ## Usage
 
 ```rust,no_run
-use git2_rustls_transport::{register, Credentials};
+use std::time::Duration;
 
-// Build the client yourself. With `Policy::none()` the transport follows
-// info/refs redirects itself (see Notes).
-let client = reqwest::blocking::Client::builder()
-    .redirect(reqwest::redirect::Policy::none())
-    // The blocking client times out whole requests after 30 s by default, which
-    // cuts off large clones. Bound only the connect.
-    .timeout(None)
-    .connect_timeout(std::time::Duration::from_secs(30))
-    .build()
-    .expect("client");
+use git2_rustls_transport::{register, Credentials, DEFAULT_MAX_REQUEST_BODY};
 
-// Called on 401. Return None to fail the request.
+// Configure TLS roots, proxy and timeouts on the builder. `register` finishes
+// it and sets the redirect policy itself (see Notes).
+let builder = reqwest::blocking::Client::builder()
+    .connect_timeout(Duration::from_secs(30))
+    // See "Timeouts" below. Never `None`: a stalled server would hang forever.
+    .timeout(Duration::from_secs(300));
+
+// Called on 401 at the remote's own origin. Return None to fail the request.
 // SAFETY: called once at start-up, before any other git2 use.
 unsafe {
-    register(client, |_url| {
+    register(builder, DEFAULT_MAX_REQUEST_BODY, |_url| {
         Some(Credentials {
             username: "user".into(),
             password: "token".into(),
@@ -51,15 +49,29 @@ let _repo = git2::build::RepoBuilder::new()
   the `register` callback's credentials. A 401 on a POST is not retried.
 - libgit2's `RemoteCallbacks::credentials` is not consulted; only the callback
   passed to `register` is.
-- Redirects: with `Policy::none()` on the client, the transport follows up to
-  5 info/refs redirects itself. With a following policy, `reqwest` follows
-  them. Either way a redirect off `https` is refused, credentials are dropped
-  when the redirect changes scheme, host or port, and a redirected POST is
-  refused.
-- The request body of each POST is buffered in memory and sent with a
-  `Content-Length`. For a push this is the whole pack.
+- Credentials (from the URL or the callback) are only sent to the remote
+  URL's own origin: scheme, host and port. After a redirect to another origin,
+  requests carry no credentials, and a 401 there fails with an error without
+  calling the callback.
+- Redirects: `register` builds the client with `reqwest`'s redirects off
+  (`Policy::none()`) and `https_only(true)`, replacing any redirect policy on
+  the builder. The transport follows up to 5 redirects of the info/refs GET
+  itself and refuses a redirect to a non-https URL. A redirect of a POST is
+  refused, so a request body is never sent anywhere but its own URL.
+- Memory: the request body of each POST is buffered in memory and sent with a
+  `Content-Length`. For a push this is the whole pack, so a push needs about
+  the pack's size in RAM. `register`'s `max_request_body` caps it
+  (`DEFAULT_MAX_REQUEST_BODY` is 256 MiB); a larger push fails with an error
+  naming the limit. Fetch and clone responses are streamed, not buffered.
+- Timeouts: `reqwest`'s blocking client has no separate read timeout. Its
+  `timeout` covers sending a request plus waiting for the response headers as
+  one budget (for a push, that includes uploading the pack and the server
+  processing it), and then each read of the response body separately. Set it
+  above your largest push's upload time. The builder default is 30 s.
+  `timeout(None)` disables it, and then a stalled server can hang a clone,
+  fetch or push forever.
 - The crate enables no TLS feature itself. TLS settings (trust roots, client
-  certificates, proxy) come from the `reqwest` client you pass in.
+  certificates, proxy) come from the `reqwest` builder you pass in.
 - On Android, `reqwest`'s platform verifier needs a JVM and JNI setup. Use
   explicit root certificates if you cannot provide one.
 
@@ -78,7 +90,9 @@ let _repo = git2::build::RepoBuilder::new()
 cargo test
 ```
 
-The tests need `git` on `PATH`.
+The tests need `git` on `PATH`. The minimum supported Rust version is 1.88
+(set by the ICU crates that `reqwest` pulls in through `url`; the test-only
+dependencies `rcgen` and `time` need it too). CI tests on 1.88.
 
 ## Licence
 
