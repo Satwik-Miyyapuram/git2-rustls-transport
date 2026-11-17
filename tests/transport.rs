@@ -133,14 +133,9 @@ fn assert_cross_origin_refused(path: &str, leak_prefix: &str) {
         .expect("cross-origin redirect must be refused");
     assert!(err.message().contains("another origin"), "got: {err}");
     let leaked = fx.seen(leak_prefix);
-    assert!(!leaked.is_empty(), "redirect target never reached");
     assert!(
-        leaked.iter().all(|s| s.method == "GET"),
-        "POST sent to another origin: {leaked:?}"
-    );
-    assert!(
-        leaked.iter().all(|s| !s.authorization),
-        "credentials sent to another origin: {leaked:?}"
+        leaked.is_empty(),
+        "request sent to another origin: {leaked:?}"
     );
 }
 
@@ -259,12 +254,37 @@ fn auth_at_a_redirected_origin_never_calls_the_callback() {
     seed("xa.git");
     let err = clone(&fx.url("xauth/xa.git"))
         .err()
-        .expect("401 at another origin must fail");
-    assert!(err.message().contains("origin"), "got: {err}");
+        .expect("redirect to another origin must fail");
+    assert!(err.message().contains("another origin"), "got: {err}");
     let there = fx.seen("/private/xa.git");
-    assert!(!there.is_empty(), "redirect target never reached");
     assert!(
-        there.iter().all(|s| !s.authorization),
-        "credentials sent to another origin: {there:?}"
+        there.is_empty(),
+        "request sent to another origin: {there:?}"
     );
+}
+
+#[test]
+fn redirect_that_leaves_and_returns_to_the_origin_is_refused() {
+    register_once();
+    let fx = fixture();
+    seed("abba.git");
+    let err = clone(&fx.url("abba/abba.git"))
+        .err()
+        .expect("A -> B -> A redirect must be refused");
+    assert!(err.message().contains("another origin"), "got: {err}");
+    let there = fx.seen("/back/abba.git");
+    assert!(
+        there.is_empty(),
+        "request sent to another origin: {there:?}"
+    );
+}
+
+#[test]
+fn non_ascii_location_is_a_bad_location() {
+    register_once();
+    let fx = fixture();
+    let err = clone(&fx.url("badloc/x.git"))
+        .err()
+        .expect("non-ASCII Location must fail");
+    assert!(err.message().contains("bad Location"), "got: {err}");
 }

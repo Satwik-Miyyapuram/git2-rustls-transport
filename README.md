@@ -49,13 +49,11 @@ let _repo = git2::build::RepoBuilder::new()
   the `register` callback's credentials. A 401 on a POST is not retried.
 - libgit2's `RemoteCallbacks::credentials` is not consulted; only the callback
   passed to `register` is.
-- Origins (scheme, host and port): an info/refs redirect that ends at an
-  origin other than the remote URL's is refused before any POST, so a pack or
-  fetch negotiation is only ever sent to the remote's own origin. Credentials
-  (from the URL or the callback) are only sent there too: an info/refs GET
-  that a redirect sends through another origin carries none, and a 401 there
-  fails without calling the callback. Userinfo in a redirect's `Location` is
-  dropped.
+- Origins (scheme, host and port): requests never leave the remote URL's
+  origin. An info/refs redirect to another origin is refused before that
+  origin is contacted, even if a later hop would come back, so no request,
+  credential (from the URL or the callback), pack or fetch negotiation is
+  ever sent anywhere else. Userinfo in a redirect's `Location` is dropped.
 - Redirects: `register` builds the client with `reqwest`'s redirects off
   (`Policy::none()`) and `https_only(true)`, replacing any redirect policy on
   the builder. The transport follows up to 5 redirects of the info/refs GET

@@ -14,10 +14,10 @@
   and retries once with basic auth. Accepted credentials are reused for later
   POSTs on the same transport. libgit2's `RemoteCallbacks::credentials` is not
   consulted.
-- An info/refs redirect that ends at another origin (scheme, host, port) is
-  refused before any POST. Credentials are only sent to the remote URL's
-  origin; a 401 at another origin fails without calling the callback.
-  Userinfo in a redirect's `Location` is dropped.
+- Requests never leave the remote URL's origin (scheme, host, port): an
+  info/refs redirect to another origin is refused before that origin is
+  contacted, even if a later hop would come back. Userinfo in a redirect's
+  `Location` is dropped, and a non-ASCII `Location` is a "bad Location" error.
 - `register` takes a `reqwest::blocking::ClientBuilder` (TLS roots, proxy and
   timeouts are the caller's choice) and builds it with `reqwest` redirects off
   and `https_only(true)`. The transport follows info/refs redirects itself; a

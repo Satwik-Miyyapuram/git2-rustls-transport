@@ -486,6 +486,20 @@ fn route(request: &Req, shared: &Shared) -> Reply {
         );
         return redirect(301, &location);
     }
+    // /abba/<repo>: redirects info/refs to another host under /back, which
+    // redirects back to the real repo here (A -> B -> A).
+    if let Some(rest) = path.strip_prefix("/abba") {
+        let location = format!("https://127.0.0.1:{}/back{}", shared.port, with_query(rest));
+        return redirect(301, &location);
+    }
+    if let Some(rest) = path.strip_prefix("/back") {
+        let location = format!("https://localhost:{}{}", shared.port, with_query(rest));
+        return redirect(301, &location);
+    }
+    // /badloc/<repo>: a redirect whose Location is not ASCII.
+    if path.starts_with("/badloc") {
+        return redirect(301, "/caf\u{e9}");
+    }
     // /tohttp/<repo>: redirects info/refs to plain http.
     if let Some(rest) = path.strip_prefix("/tohttp") {
         let location = format!("http://localhost:{}{}", shared.port, with_query(rest));

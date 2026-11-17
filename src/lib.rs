@@ -118,12 +118,11 @@ impl fmt::Debug for Credentials {
 /// first. libgit2's `RemoteCallbacks::credentials` is never consulted; only
 /// `credentials` here is.
 ///
-/// An origin is scheme, host and port. An info/refs redirect that ends at an
-/// origin other than the remote URL's is refused before any POST, so a pack
-/// or negotiation is only sent to the remote's own origin. Credentials are
-/// only sent there too: an info/refs GET that a redirect sends through another
-/// origin carries none, and a `401` there fails without calling
-/// `credentials`. Userinfo in a redirect's `Location` is dropped.
+/// An origin is scheme, host and port. Requests never leave the remote URL's
+/// origin: an info/refs redirect to another origin is refused before that
+/// origin is contacted, even if a later hop would come back, so no request,
+/// credential, pack or negotiation is sent anywhere else. Userinfo in a
+/// redirect's `Location` is dropped.
 ///
 /// libgit2's transport registry is process-global, so call this once at
 /// start-up. A second call returns an error from libgit2.

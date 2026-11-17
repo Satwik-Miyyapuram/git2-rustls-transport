@@ -107,13 +107,23 @@ impl Subtransport {
             let location = response
                 .headers()
                 .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| Error::from_str("https transport: redirect without Location"))?
+                .to_str()
+                .map_err(|_| Error::from_str("https transport: bad Location: not ASCII"))?
                 .to_owned();
             let next = target
                 .join(&location)
                 .map_err(|e| Error::from_str(&format!("https transport: bad redirect: {e}")))?;
             check_redirect(&next)?;
+            // Every hop stays on the remote's origin, so no request (and no
+            // POST to a base taken from here) ever goes anywhere else.
+            if !self.is_start_origin(&next) {
+                return Err(Error::from_str(&format!(
+                    "https transport: info/refs redirected to another origin ({}); refused, \
+                     requests never leave the remote's origin",
+                    redact(&next)
+                )));
+            }
             // Userinfo in a Location would become an Authorization header.
             target = without_userinfo(&next);
             response = self.get_authenticated(&target)?;
@@ -124,15 +134,6 @@ impl Subtransport {
         if !response.status().is_success() {
             return Err(Error::from_str(&http_error(response.status(), &target)));
         }
-        // The POSTs go to the base taken from here. At another origin they
-        // would carry the pack or wants/haves away from the remote.
-        if !self.is_start_origin(&target) {
-            return Err(Error::from_str(&format!(
-                "https transport: info/refs redirected to another origin ({}); refused, \
-                 requests only go to the remote's own origin",
-                redact(&target)
-            )));
-        }
         require_content_type(&response, &format!("application/x-{service}-advertisement"))?;
         self.state().base = Some(base_from_info_refs(&target)?);
         Ok(Stream::Advertisement(Advertisement {
@@ -142,9 +143,9 @@ impl Subtransport {
         }))
     }
 
-    /// GET with the accepted credentials. On a 401 at the remote's own origin,
-    /// asks the callback and retries once. A 401 at any other origin (reached
-    /// by a redirect) fails without asking: credentials never leave the origin.
+    /// GET with the accepted credentials. On a 401, asks the callback and
+    /// retries once. `advertise` only calls it for the remote's own origin;
+    /// the check below keeps the callback from ever seeing another one.
     fn get_authenticated(&self, url: &Url) -> Result<Response, Error> {
         let response = self.get(url, self.credentials_for(url).as_ref())?;
         if response.status() != StatusCode::UNAUTHORIZED {
@@ -152,8 +153,7 @@ impl Subtransport {
         }
         if !self.is_start_origin(url) {
             return Err(Error::from_str(&format!(
-                "https transport: HTTP 401 from {} after a redirect to another origin; \
-                 credentials are only sent to the remote's own origin",
+                "https transport: HTTP 401 from another origin ({}); refused",
                 redact(url)
             )));
         }
@@ -261,13 +261,13 @@ impl Write for Stream {
 }
 
 /// The info/refs body, read through at most `limit` bytes.
-pub(crate) struct Advertisement {
-    response: Response,
+pub(crate) struct Advertisement<R = Response> {
+    response: R,
     remaining: usize,
     limit: usize,
 }
 
-impl Read for Advertisement {
+impl<R: Read> Read for Advertisement<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 {
             // At the limit: the body must end here.
@@ -511,5 +511,81 @@ mod tests {
         let text = network_error(error).message().to_owned();
         assert!(!text.contains("hunter2"), "{text}");
         assert!(!text.contains("alice"), "{text}");
+    }
+
+    /// Serves one canned reply per connection, recording whether each request
+    /// carried an Authorization header.
+    fn serve(replies: Vec<&'static str>) -> (Url, std::thread::JoinHandle<Vec<bool>>) {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/repo.git",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut auth = Vec::new();
+            for reply in replies {
+                let (mut tcp, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(tcp.try_clone().unwrap());
+                let mut seen = false;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    seen |= line.to_ascii_lowercase().starts_with("authorization:");
+                }
+                auth.push(seen);
+                let head =
+                    format!("HTTP/1.1 {reply}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                tcp.write_all(head.as_bytes()).unwrap();
+            }
+            auth
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn credentials_refused_with_403_are_not_kept() {
+        let (url, server) = serve(vec!["401 Unauthorized", "403 Forbidden", "200 OK"]);
+        let callback = |_: &str| {
+            Some(Credentials {
+                username: "alice".to_owned(),
+                password: "hunter2".to_owned(),
+            })
+        };
+        let client = Client::builder().no_proxy().build().unwrap();
+        let sub = Subtransport::new(client, Arc::new(callback), Limits::default());
+        sub.base_for(url.as_str()).unwrap();
+        let response = sub.get_authenticated(&url).unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(sub.state().accepted.is_none());
+        // The next request goes out without them.
+        let next = sub.get(&url, sub.credentials_for(&url).as_ref()).unwrap();
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(server.join().unwrap(), vec![false, true, false]);
+    }
+
+    fn advertisement(body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
+        let mut reader = Advertisement {
+            response: io::Cursor::new(body.to_vec()),
+            remaining: limit,
+            limit,
+        };
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).map(|_| out)
+    }
+
+    #[test]
+    fn advertisement_exactly_at_the_limit_is_accepted() {
+        assert_eq!(advertisement(b"0123456789", 10).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn advertisement_one_byte_over_the_limit_is_refused() {
+        let err = advertisement(b"0123456789a", 10).unwrap_err();
+        assert!(err.to_string().contains("10-byte limit"), "{err}");
     }
 }
