@@ -1,0 +1,34 @@
+[package]
+name = "git2-rustls-transport"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "git2 smart-HTTP transport for libgit2 over blocking reqwest + rustls (no OpenSSL)"
+repository = "https://github.com/Satwik-Miyyapuram/git2-rustls-transport"
+readme = "README.md"
+keywords = ["git", "libgit2", "rustls", "android", "transport"]
+categories = ["development-tools"]
+
+[dependencies]
+git2 = { version = "0.21", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
+
+[dev-dependencies]
+git2 = { version = "0.21", default-features = false, features = [] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+webpki-root-certs = "1"
+base64 = "0.22"
+tempfile = "3"
+
+# Q1: on Windows, libgit2 ships its own https transport (WinHTTP) when the
+# `https` feature is on. The override test needs that enabled.
+[target.'cfg(windows)'.dev-dependencies]
+git2 = { version = "0.21", default-features = false, features = ["https"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
