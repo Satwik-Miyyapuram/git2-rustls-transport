@@ -22,7 +22,7 @@
 //! unsafe {
 //!     git2_rustls_transport::register(
 //!         builder,
-//!         git2_rustls_transport::DEFAULT_MAX_REQUEST_BODY,
+//!         git2_rustls_transport::Limits::default(),
 //!         |_url| None,
 //!     )?
 //! };
@@ -41,8 +41,47 @@ mod transport;
 use transport::{CredentialCallback, Subtransport};
 
 /// Default cap on one POST body (256 MiB). A push buffers its whole pack in
-/// memory before sending, so this bounds the memory a push can use.
+/// memory before sending; peak memory can reach about twice the cap while the
+/// buffer grows.
 pub const DEFAULT_MAX_REQUEST_BODY: usize = 256 * 1024 * 1024;
+
+/// Default cap on one info/refs response, the ref advertisement (64 MiB).
+pub const DEFAULT_MAX_ADVERTISEMENT: usize = 64 * 1024 * 1024;
+
+/// Size caps passed to [`register`]. Start from `Limits::default()` and
+/// change what you need.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    max_request_body: usize,
+    max_advertisement: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_request_body: DEFAULT_MAX_REQUEST_BODY,
+            max_advertisement: DEFAULT_MAX_ADVERTISEMENT,
+        }
+    }
+}
+
+impl Limits {
+    /// Caps one POST body in bytes ([`DEFAULT_MAX_REQUEST_BODY`]). A push
+    /// buffers its whole pack in memory (up to about twice this while the
+    /// buffer grows), and a larger push fails with an error naming the limit.
+    pub fn max_request_body(mut self, bytes: usize) -> Self {
+        self.max_request_body = bytes;
+        self
+    }
+
+    /// Caps the info/refs response in bytes ([`DEFAULT_MAX_ADVERTISEMENT`]),
+    /// so a server cannot stream an endless ref list. A larger one fails with
+    /// an error naming the limit.
+    pub fn max_advertisement(mut self, bytes: usize) -> Self {
+        self.max_advertisement = bytes;
+        self
+    }
+}
 
 /// Basic-auth credentials returned by the credential callback.
 #[derive(Clone, PartialEq, Eq)]
@@ -68,9 +107,8 @@ impl fmt::Debug for Credentials {
 /// itself, refuses redirects to non-https URLs, and refuses any redirect of a
 /// POST, so a request body is only ever sent to the URL it was meant for.
 ///
-/// `max_request_body` caps one POST body in bytes. A push buffers its whole
-/// pack in memory, so a push whose pack is larger fails with an error naming
-/// the limit. [`DEFAULT_MAX_REQUEST_BODY`] is 256 MiB.
+/// `limits` caps one POST body (a push's whole pack, buffered in memory) and
+/// the info/refs response; see [`Limits`].
 ///
 /// `credentials` is called with the URL of a request that returned `401`. It
 /// returns `None` to give up. Credentials that succeed are cached for the
@@ -80,9 +118,12 @@ impl fmt::Debug for Credentials {
 /// first. libgit2's `RemoteCallbacks::credentials` is never consulted; only
 /// `credentials` here is.
 ///
-/// Credentials are only sent to the remote URL's own origin (scheme, host and
-/// port). After a redirect to another origin, requests carry no credentials,
-/// and a `401` there fails without calling `credentials`.
+/// An origin is scheme, host and port. An info/refs redirect that ends at an
+/// origin other than the remote URL's is refused before any POST, so a pack
+/// or negotiation is only sent to the remote's own origin. Credentials are
+/// only sent there too: an info/refs GET that a redirect sends through another
+/// origin carries none, and a `401` there fails without calling
+/// `credentials`. Userinfo in a redirect's `Location` is dropped.
 ///
 /// libgit2's transport registry is process-global, so call this once at
 /// start-up. A second call returns an error from libgit2.
@@ -96,7 +137,7 @@ impl fmt::Debug for Credentials {
 /// any other git2 use.
 pub unsafe fn register<F>(
     builder: reqwest::blocking::ClientBuilder,
-    max_request_body: usize,
+    limits: Limits,
     credentials: F,
 ) -> Result<(), git2::Error>
 where
@@ -111,8 +152,7 @@ where
     // SAFETY: the caller upholds the synchronisation contract above.
     unsafe {
         git2::transport::register("https", move |remote| {
-            let subtransport =
-                Subtransport::new(client.clone(), Arc::clone(&callback), max_request_body);
+            let subtransport = Subtransport::new(client.clone(), Arc::clone(&callback), limits);
             Transport::smart(remote, true, subtransport)
         })
     }

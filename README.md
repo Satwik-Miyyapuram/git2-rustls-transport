@@ -11,7 +11,7 @@ useful on Android, where OpenSSL is awkward to build.
 ```rust,no_run
 use std::time::Duration;
 
-use git2_rustls_transport::{register, Credentials, DEFAULT_MAX_REQUEST_BODY};
+use git2_rustls_transport::{register, Credentials, Limits};
 
 // Configure TLS roots, proxy and timeouts on the builder. `register` finishes
 // it and sets the redirect policy itself (see Notes).
@@ -23,7 +23,7 @@ let builder = reqwest::blocking::Client::builder()
 // Called on 401 at the remote's own origin. Return None to fail the request.
 // SAFETY: called once at start-up, before any other git2 use.
 unsafe {
-    register(builder, DEFAULT_MAX_REQUEST_BODY, |_url| {
+    register(builder, Limits::default(), |_url| {
         Some(Credentials {
             username: "user".into(),
             password: "token".into(),
@@ -49,20 +49,26 @@ let _repo = git2::build::RepoBuilder::new()
   the `register` callback's credentials. A 401 on a POST is not retried.
 - libgit2's `RemoteCallbacks::credentials` is not consulted; only the callback
   passed to `register` is.
-- Credentials (from the URL or the callback) are only sent to the remote
-  URL's own origin: scheme, host and port. After a redirect to another origin,
-  requests carry no credentials, and a 401 there fails with an error without
-  calling the callback.
+- Origins (scheme, host and port): an info/refs redirect that ends at an
+  origin other than the remote URL's is refused before any POST, so a pack or
+  fetch negotiation is only ever sent to the remote's own origin. Credentials
+  (from the URL or the callback) are only sent there too: an info/refs GET
+  that a redirect sends through another origin carries none, and a 401 there
+  fails without calling the callback. Userinfo in a redirect's `Location` is
+  dropped.
 - Redirects: `register` builds the client with `reqwest`'s redirects off
   (`Policy::none()`) and `https_only(true)`, replacing any redirect policy on
   the builder. The transport follows up to 5 redirects of the info/refs GET
   itself and refuses a redirect to a non-https URL. A redirect of a POST is
   refused, so a request body is never sent anywhere but its own URL.
 - Memory: the request body of each POST is buffered in memory and sent with a
-  `Content-Length`. For a push this is the whole pack, so a push needs about
-  the pack's size in RAM. `register`'s `max_request_body` caps it
-  (`DEFAULT_MAX_REQUEST_BODY` is 256 MiB); a larger push fails with an error
-  naming the limit. Fetch and clone responses are streamed, not buffered.
+  `Content-Length`. For a push this is the whole pack, and while the buffer
+  grows a push can use up to about twice the pack's size in RAM.
+  `Limits::max_request_body` caps the body (`DEFAULT_MAX_REQUEST_BODY` is
+  256 MiB); a larger push fails with an error naming the limit. Fetch and
+  clone responses are streamed, not buffered. `Limits::max_advertisement`
+  caps the info/refs response (`DEFAULT_MAX_ADVERTISEMENT` is 64 MiB), so a
+  server cannot stream an endless ref list.
 - Timeouts: `reqwest`'s blocking client has no separate read timeout. Its
   `timeout` covers sending a request plus waiting for the response headers as
   one budget (for a push, that includes uploading the pack and the server

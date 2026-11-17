@@ -12,7 +12,7 @@ use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::{StatusCode, Url};
 
-use crate::Credentials;
+use crate::{Credentials, Limits};
 
 const USER_AGENT_VALUE: &str = concat!("git2-rustls-transport/", env!("CARGO_PKG_VERSION"));
 const MAX_REDIRECTS: usize = 5;
@@ -36,26 +36,24 @@ pub(crate) struct Subtransport {
     /// `advertise` or `RpcStream::read`.
     client: Client,
     callback: Arc<CredentialCallback>,
-    max_request_body: usize,
+    limits: Limits,
     state: Mutex<AuthState>,
 }
 
 impl Subtransport {
-    pub(crate) fn new(
-        client: Client,
-        callback: Arc<CredentialCallback>,
-        max_request_body: usize,
-    ) -> Self {
+    pub(crate) fn new(client: Client, callback: Arc<CredentialCallback>, limits: Limits) -> Self {
         Self {
             client,
             callback,
-            max_request_body,
+            limits,
             state: Mutex::new(AuthState::default()),
         }
     }
 
     fn state(&self) -> MutexGuard<'_, AuthState> {
-        self.state.lock().unwrap_or_else(|poison| poison.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// The repository base URL, without userinfo. On first use, credentials in
@@ -69,8 +67,8 @@ impl Subtransport {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             if state.accepted.is_none() {
                 state.accepted = Some(Credentials {
-                    username: decode(parsed.username()),
-                    password: decode(parsed.password().unwrap_or("")),
+                    username: decode(parsed.username())?,
+                    password: decode(parsed.password().unwrap_or(""))?,
                 });
             }
             parsed = without_userinfo(&parsed);
@@ -116,7 +114,8 @@ impl Subtransport {
                 .join(&location)
                 .map_err(|e| Error::from_str(&format!("https transport: bad redirect: {e}")))?;
             check_redirect(&next)?;
-            target = next;
+            // Userinfo in a Location would become an Authorization header.
+            target = without_userinfo(&next);
             response = self.get_authenticated(&target)?;
         }
         if response.status().is_redirection() {
@@ -125,9 +124,22 @@ impl Subtransport {
         if !response.status().is_success() {
             return Err(Error::from_str(&http_error(response.status(), &target)));
         }
+        // The POSTs go to the base taken from here. At another origin they
+        // would carry the pack or wants/haves away from the remote.
+        if !self.is_start_origin(&target) {
+            return Err(Error::from_str(&format!(
+                "https transport: info/refs redirected to another origin ({}); refused, \
+                 requests only go to the remote's own origin",
+                redact(&target)
+            )));
+        }
         require_content_type(&response, &format!("application/x-{service}-advertisement"))?;
-        self.state().base = Some(base_from_info_refs(response.url())?);
-        Ok(Stream::Advertisement(response))
+        self.state().base = Some(base_from_info_refs(&target)?);
+        Ok(Stream::Advertisement(Advertisement {
+            response,
+            remaining: self.limits.max_advertisement,
+            limit: self.limits.max_advertisement,
+        }))
     }
 
     /// GET with the accepted credentials. On a 401 at the remote's own origin,
@@ -154,12 +166,18 @@ impl Subtransport {
                 "https transport: 401 after retry with the supplied credentials",
             ));
         }
-        self.state().accepted = Some(credentials);
+        // Keep them only if the server took them; a 403/404/5xx fails later.
+        if retried.status().is_success() || retried.status().is_redirection() {
+            self.state().accepted = Some(credentials);
+        }
         Ok(retried)
     }
 
     fn get(&self, url: &Url, credentials: Option<&Credentials>) -> Result<Response, Error> {
-        let mut request = self.client.get(url.clone()).header(USER_AGENT, USER_AGENT_VALUE);
+        let mut request = self
+            .client
+            .get(url.clone())
+            .header(USER_AGENT, USER_AGENT_VALUE);
         if let Some(c) = credentials {
             request = request.basic_auth(&c.username, Some(&c.password));
         }
@@ -181,7 +199,7 @@ impl Subtransport {
         Ok(Stream::Rpc(Box::new(RpcStream {
             request: Some(request),
             body: Vec::new(),
-            max_body: self.max_request_body,
+            max_body: self.limits.max_request_body,
             response: None,
             target,
             result_type: format!("application/x-{service}-result"),
@@ -212,7 +230,7 @@ impl SmartSubtransport for Subtransport {
 /// What libgit2 reads and writes for one action.
 pub(crate) enum Stream {
     /// info/refs body, read-only.
-    Advertisement(Response),
+    Advertisement(Advertisement),
     /// POST: request body written by libgit2, reply read back.
     Rpc(Box<RpcStream>),
 }
@@ -220,7 +238,7 @@ pub(crate) enum Stream {
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Stream::Advertisement(response) => response.read(buf),
+            Stream::Advertisement(advertisement) => advertisement.read(buf),
             Stream::Rpc(rpc) => rpc.read(buf),
         }
     }
@@ -239,6 +257,34 @@ impl Write for Stream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// The info/refs body, read through at most `limit` bytes.
+pub(crate) struct Advertisement {
+    response: Response,
+    remaining: usize,
+    limit: usize,
+}
+
+impl Read for Advertisement {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            // At the limit: the body must end here.
+            let mut probe = [0u8; 1];
+            return match self.response.read(&mut probe)? {
+                0 => Ok(0),
+                _ => Err(io::Error::other(format!(
+                    "https transport: info/refs advertisement exceeds the {}-byte limit \
+                     (Limits::max_advertisement)",
+                    self.limit
+                ))),
+            };
+        }
+        let len = buf.len().min(self.remaining);
+        let n = self.response.read(&mut buf[..len])?;
+        self.remaining -= n;
+        Ok(n)
     }
 }
 
@@ -269,7 +315,7 @@ impl Write for RpcStream {
             self.body = Vec::new();
             return Err(io::Error::other(format!(
                 "https transport: request body exceeds the {}-byte limit \
-                 (max_request_body in register)",
+                 (Limits::max_request_body)",
                 self.max_body
             )));
         }
@@ -286,9 +332,10 @@ impl Read for RpcStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.response.is_none() {
             // Reading means the request body is complete: send it.
-            let request = self.request.take().ok_or_else(|| {
-                io::Error::other("https transport: request already failed")
-            })?;
+            let request = self
+                .request
+                .take()
+                .ok_or_else(|| io::Error::other("https transport: request already failed"))?;
             let response = request
                 .body(mem::take(&mut self.body))
                 .send()
@@ -299,7 +346,10 @@ impl Read for RpcStream {
                 ));
             }
             if !response.status().is_success() {
-                return Err(io::Error::other(http_error(response.status(), &self.target)));
+                return Err(io::Error::other(http_error(
+                    response.status(),
+                    &self.target,
+                )));
             }
             check_content_type(&response, &self.result_type).map_err(io::Error::other)?;
             self.response = Some(response);
@@ -313,7 +363,10 @@ impl Read for RpcStream {
 
 fn parse_url(raw: &str) -> Result<Url, Error> {
     Url::parse(raw).map_err(|e| {
-        Error::from_str(&format!("https transport: bad URL {}: {e}", redact_raw(raw)))
+        Error::from_str(&format!(
+            "https transport: bad URL {}: {e}",
+            redact_raw(raw)
+        ))
     })
 }
 
@@ -343,17 +396,24 @@ fn redact_raw(raw: &str) -> String {
     }
 }
 
-fn decode(component: &str) -> String {
-    percent_decode_str(component).decode_utf8_lossy().into_owned()
+/// Percent-decodes a userinfo part of the remote URL. Non-UTF-8 is an error:
+/// a lossy decode would silently send different credentials.
+fn decode(component: &str) -> Result<String, Error> {
+    percent_decode_str(component)
+        .decode_utf8()
+        .map(|text| text.into_owned())
+        .map_err(|_| {
+            Error::from_str("https transport: credentials in the remote URL are not valid UTF-8")
+        })
 }
 
 /// Strips `/info/refs` (and its query) to get the repository base URL.
 fn base_from_info_refs(url: &Url) -> Result<String, Error> {
     let path = url.path();
-    let stripped = path.strip_suffix("/info/refs").ok_or_else(|| {
-        Error::from_str("https transport: redirect did not end at /info/refs")
-    })?;
-    let mut base = url.clone();
+    let stripped = path
+        .strip_suffix("/info/refs")
+        .ok_or_else(|| Error::from_str("https transport: redirect did not end at /info/refs"))?;
+    let mut base = without_userinfo(url);
     base.set_query(None);
     base.set_path(stripped);
     Ok(base.as_str().trim_end_matches('/').to_owned())
@@ -428,6 +488,16 @@ mod tests {
         let err = parse_url("https://alice:pa/ss@example.com/repo.git").unwrap_err();
         assert!(!err.message().contains("pa/ss"), "{}", err.message());
         assert!(!err.message().contains("alice"), "{}", err.message());
+    }
+
+    #[test]
+    fn non_utf8_userinfo_is_an_error() {
+        let sub = Subtransport::new(Client::new(), Arc::new(|_: &str| None), Limits::default());
+        let err = sub
+            .base_for("https://alice:%FF@example.com/repo.git")
+            .unwrap_err();
+        assert!(err.message().contains("UTF-8"), "{}", err.message());
+        assert!(sub.state().accepted.is_none());
     }
 
     #[test]

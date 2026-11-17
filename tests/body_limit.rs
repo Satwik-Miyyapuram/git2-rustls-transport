@@ -3,14 +3,14 @@
 
 mod common;
 
-use common::{fixture, git, register_once_with_limit, seed};
+use common::{fixture, git, register_once_with_limits, seed};
 use git2::build::RepoBuilder;
 
 const LIMIT: usize = 4096;
 
 #[test]
 fn push_over_the_body_limit_fails_clearly() {
-    register_once_with_limit(LIMIT);
+    register_once_with_limits(git2_rustls_transport::Limits::default().max_request_body(LIMIT));
     let fx = fixture();
     seed("limit.git");
     let dir = tempfile::tempdir().expect("temp clone dir");
@@ -33,7 +33,16 @@ fn push_over_the_body_limit_fails_clearly() {
     git(dir.path(), &["add", "noise.bin"]);
     git(
         dir.path(),
-        &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "noise"],
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "noise",
+        ],
     );
 
     let err = repo

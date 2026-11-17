@@ -14,14 +14,18 @@
   and retries once with basic auth. Accepted credentials are reused for later
   POSTs on the same transport. libgit2's `RemoteCallbacks::credentials` is not
   consulted.
-- Credentials are only sent to the remote URL's origin (scheme, host, port).
-  A 401 after a redirect to another origin fails without calling the
-  callback.
+- An info/refs redirect that ends at another origin (scheme, host, port) is
+  refused before any POST. Credentials are only sent to the remote URL's
+  origin; a 401 at another origin fails without calling the callback.
+  Userinfo in a redirect's `Location` is dropped.
 - `register` takes a `reqwest::blocking::ClientBuilder` (TLS roots, proxy and
   timeouts are the caller's choice) and builds it with `reqwest` redirects off
   and `https_only(true)`. The transport follows info/refs redirects itself; a
   redirect on a POST or to a non-https URL is refused.
-- `register` takes `max_request_body`, a cap on one buffered POST body (a
-  push's whole pack); `DEFAULT_MAX_REQUEST_BODY` is 256 MiB.
+- `register` takes `Limits`: `max_request_body` caps one buffered POST body
+  (a push's whole pack; `DEFAULT_MAX_REQUEST_BODY` is 256 MiB) and
+  `max_advertisement` caps the info/refs response
+  (`DEFAULT_MAX_ADVERTISEMENT` is 64 MiB).
+- Non-UTF-8 percent-encoded credentials in the remote URL are an error.
 - Error messages never include the URL's username or password.
 - Minimum supported Rust version: 1.88.

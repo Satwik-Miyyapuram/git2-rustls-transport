@@ -16,7 +16,8 @@ fn builtin_https_is_used_when_nothing_is_registered() {
     let dir = tempfile::tempdir().unwrap();
     let err = RepoBuilder::new()
         .clone(&fx.url("builtin.git"), dir.path())
-        .err().expect("WinHTTP must reject the self-signed certificate");
+        .err()
+        .expect("WinHTTP must reject the self-signed certificate");
     eprintln!("builtin clone error: {err}");
     assert!(fx.user_agents().iter().all(|ua| !ua.starts_with(UA_PREFIX)));
 }

@@ -62,8 +62,9 @@ pub fn fixture() -> &'static Fixture {
             "localhost".to_owned(),
             "127.0.0.1".to_owned(),
         ])
-            .expect("self-signed cert");
-        let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+        .expect("self-signed cert");
+        let key_der =
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
         let server_config = Arc::new(
             ServerConfig::builder_with_provider(Arc::new(
                 rustls::crypto::aws_lc_rs::default_provider(),
@@ -152,19 +153,17 @@ impl Fixture {
 /// Registers the transport once per process. The callback supplies credentials
 /// only for the test paths that need them.
 pub fn register_once() {
-    register_once_with_limit(git2_rustls_transport::DEFAULT_MAX_REQUEST_BODY);
+    register_once_with_limits(git2_rustls_transport::Limits::default());
 }
 
-/// `register_once` with a request-body cap. Registration is process-global,
-/// so a test binary uses one limit for all its tests.
-pub fn register_once_with_limit(max_request_body: usize) {
+/// `register_once` with custom size caps. Registration is process-global, so
+/// a test binary uses one set of limits for all its tests.
+pub fn register_once_with_limits(limits: git2_rustls_transport::Limits) {
     REGISTER.call_once(|| {
         // SAFETY: `Once` serialises registration, and no test creates a
         // transport before `register_once` returns.
-        unsafe {
-            git2_rustls_transport::register(fixture().builder(), max_request_body, callback)
-        }
-        .expect("register https transport");
+        unsafe { git2_rustls_transport::register(fixture().builder(), limits, callback) }
+            .expect("register https transport");
     });
 }
 
@@ -336,7 +335,9 @@ fn read_request(reader: &mut impl BufRead) -> io::Result<Option<Req>> {
     if chunked {
         request.body = read_chunked(reader)?;
     } else if let Some(len) = request.header("Content-Length") {
-        let len: usize = len.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let len: usize = len
+            .parse()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         request.body = vec![0; len];
         reader.read_exact(&mut request.body)?;
     }
@@ -375,7 +376,11 @@ fn write_reply(out: &mut impl Write, reply: &Reply) -> io::Result<()> {
     for (name, value) in &reply.headers {
         write!(out, "{name}: {value}\r\n")?;
     }
-    write!(out, "Content-Length: {}\r\nConnection: close\r\n\r\n", reply.body.len())?;
+    write!(
+        out,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        reply.body.len()
+    )?;
     out.write_all(&reply.body)?;
     out.flush()
 }
@@ -432,7 +437,11 @@ fn route(request: &Req, shared: &Shared) -> Reply {
             shared.unauthorized.fetch_add(1, Ordering::SeqCst);
             return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
         }
-        let location = format!("https://localhost:{}/leak{}", shared.alt_port, with_query(rest));
+        let location = format!(
+            "https://localhost:{}/leak{}",
+            shared.alt_port,
+            with_query(rest)
+        );
         return redirect(301, &location);
     }
     // /xpost/<repo>: GETs need auth and are served; POSTs get a 307 to another
@@ -447,12 +456,34 @@ fn route(request: &Req, shared: &Shared) -> Reply {
             return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
         }
         let content_type = request.header("Content-Type");
-        return run_cgi(&shared.root, rest, &request.method, query, content_type, Some(USER), &request.body);
+        return run_cgi(
+            &shared.root,
+            rest,
+            &request.method,
+            query,
+            content_type,
+            Some(USER),
+            &request.body,
+        );
     }
     // /xauth/<repo>: redirects info/refs, with no auth, to /private on another
     // host. The 401 there must not reach the credential callback.
     if let Some(rest) = path.strip_prefix("/xauth") {
-        let location = format!("https://127.0.0.1:{}/private{}", shared.port, with_query(rest));
+        let location = format!(
+            "https://127.0.0.1:{}/private{}",
+            shared.port,
+            with_query(rest)
+        );
+        return redirect(301, &location);
+    }
+    // /uiloc/<repo>: redirects info/refs to the same origin under /leak, with
+    // userinfo in the Location. It must not become an Authorization header.
+    if let Some(rest) = path.strip_prefix("/uiloc") {
+        let location = format!(
+            "https://evil:stolen@localhost:{}/leak{}",
+            shared.port,
+            with_query(rest)
+        );
         return redirect(301, &location);
     }
     // /tohttp/<repo>: redirects info/refs to plain http.

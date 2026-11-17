@@ -43,7 +43,10 @@ fn fetch_over_https() {
     remote
         .fetch(&["refs/heads/main:refs/remotes/origin/main"], None, None)
         .expect("fetch over https");
-    assert_eq!(repo.refname_to_id("refs/remotes/origin/main").unwrap(), expected);
+    assert_eq!(
+        repo.refname_to_id("refs/remotes/origin/main").unwrap(),
+        expected
+    );
 }
 
 #[test]
@@ -83,7 +86,9 @@ fn basic_auth_401_without_callback_credentials_fails() {
     register_once();
     let fx = fixture();
     seed("none.git");
-    let err = clone(&fx.url("nocreds/none.git")).err().expect("clone must fail");
+    let err = clone(&fx.url("nocreds/none.git"))
+        .err()
+        .expect("clone must fail");
     assert!(err.message().contains("credential callback"), "got: {err}");
 }
 
@@ -92,7 +97,9 @@ fn basic_auth_wrong_credentials_fail() {
     register_once();
     let fx = fixture();
     seed("bad.git");
-    let err = clone(&fx.url("badauth/bad.git")).err().expect("clone must fail");
+    let err = clone(&fx.url("badauth/bad.git"))
+        .err()
+        .expect("clone must fail");
     assert!(err.message().contains("401"), "got: {err}");
 }
 
@@ -110,21 +117,38 @@ fn post_redirect_is_refused() {
     register_once();
     let fx = fixture();
     seed("redir.git");
-    let err = clone(&fx.url("redir/redir.git")).err().expect("POST redirect must be refused");
+    let err = clone(&fx.url("redir/redir.git"))
+        .err()
+        .expect("POST redirect must be refused");
     assert!(err.message().contains("redirect"), "got: {err}");
 }
 
-#[test]
-fn cross_host_redirect_drops_credentials() {
-    register_once();
+/// A clone whose info/refs is redirected to another origin must fail before
+/// any POST: the wants/haves (and a push's pack) never reach that origin, and
+/// the GET that reached it carried no credentials.
+fn assert_cross_origin_refused(path: &str, leak_prefix: &str) {
     let fx = fixture();
-    seed("xh.git");
-    let (dir, _repo) = clone(&fx.url("xhost/xh.git")).expect("clone through cross-host redirect");
-    assert!(dir.path().join("README.md").is_file());
-    let leaked = fx.seen("/leak/xh.git");
+    let err = clone(&fx.url(path))
+        .err()
+        .expect("cross-origin redirect must be refused");
+    assert!(err.message().contains("another origin"), "got: {err}");
+    let leaked = fx.seen(leak_prefix);
     assert!(!leaked.is_empty(), "redirect target never reached");
-    assert!(leaked.iter().all(|s| s.host.starts_with("127.0.0.1")), "{leaked:?}");
-    assert!(leaked.iter().all(|s| !s.authorization), "credentials sent to another host: {leaked:?}");
+    assert!(
+        leaked.iter().all(|s| s.method == "GET"),
+        "POST sent to another origin: {leaked:?}"
+    );
+    assert!(
+        leaked.iter().all(|s| !s.authorization),
+        "credentials sent to another origin: {leaked:?}"
+    );
+}
+
+#[test]
+fn cross_host_redirect_is_refused_without_credentials() {
+    register_once();
+    seed("xh.git");
+    assert_cross_origin_refused("xhost/xh.git", "/leak/xh.git");
 }
 
 #[test]
@@ -132,7 +156,9 @@ fn redirect_to_http_is_refused() {
     register_once();
     let fx = fixture();
     seed("plain.git");
-    let err = clone(&fx.url("tohttp/plain.git")).err().expect("https->http redirect must be refused");
+    let err = clone(&fx.url("tohttp/plain.git"))
+        .err()
+        .expect("https->http redirect must be refused");
     assert!(err.message().contains("non-https"), "got: {err}");
 }
 
@@ -143,13 +169,18 @@ fn userinfo_url_clones_and_pushes_without_callback() {
     let seeded = seed("ui.git");
     // /nocreds/ needs auth and the callback returns None for it: the
     // credentials can only come from the URL.
-    let url = fx
-        .url("nocreds/ui.git")
-        .replacen("https://", &format!("https://{USER}:{PASSWORD}@"), 1);
+    let url =
+        fx.url("nocreds/ui.git")
+            .replacen("https://", &format!("https://{USER}:{PASSWORD}@"), 1);
     let (dir, repo) = clone(&url).expect("clone with userinfo URL");
 
-    commit_file(dir.path(), "UI.md", "ui
-", "push with userinfo");
+    commit_file(
+        dir.path(),
+        "UI.md",
+        "ui
+",
+        "push with userinfo",
+    );
     let local: Oid = repo.head().unwrap().target().unwrap();
     repo.find_remote("origin")
         .unwrap()
@@ -174,19 +205,35 @@ fn post_bodies_carry_content_length() {
         .filter(|s| s.method == "POST")
         .collect();
     assert!(!posts.is_empty(), "no POST seen");
-    assert!(posts.iter().all(|s| s.content_length && !s.chunked), "{posts:?}");
+    assert!(
+        posts.iter().all(|s| s.content_length && !s.chunked),
+        "{posts:?}"
+    );
 }
 
 #[test]
-fn port_only_redirect_drops_credentials() {
+fn port_only_redirect_is_refused_without_credentials() {
+    register_once();
+    seed("xpt.git");
+    assert_cross_origin_refused("xport/xpt.git", "/leak/xpt.git");
+}
+
+#[test]
+fn userinfo_in_a_redirect_location_is_never_sent() {
     register_once();
     let fx = fixture();
-    seed("xpt.git");
-    let (dir, _repo) = clone(&fx.url("xport/xpt.git")).expect("clone through port-change redirect");
+    seed("ul.git");
+    let (dir, _repo) = clone(&fx.url("uiloc/ul.git")).expect("clone through same-origin redirect");
     assert!(dir.path().join("README.md").is_file());
-    let leaked = fx.seen("/leak/xpt.git");
-    assert!(!leaked.is_empty(), "redirect target never reached");
-    assert!(leaked.iter().all(|s| !s.authorization), "credentials sent to another port: {leaked:?}");
+    let there = fx.seen("/leak/ul.git");
+    assert!(
+        there.iter().any(|s| s.method == "POST"),
+        "no POST after the redirect: {there:?}"
+    );
+    assert!(
+        there.iter().all(|s| !s.authorization),
+        "Location userinfo became credentials: {there:?}"
+    );
 }
 
 #[test]
@@ -194,10 +241,15 @@ fn post_redirect_to_another_origin_never_delivers_the_body() {
     register_once();
     let fx = fixture();
     seed("xp.git");
-    let err = clone(&fx.url("xpost/xp.git")).err().expect("POST redirect must be refused");
+    let err = clone(&fx.url("xpost/xp.git"))
+        .err()
+        .expect("POST redirect must be refused");
     assert!(err.message().contains("redirect"), "got: {err}");
     let leaked = fx.seen("/leak/xp.git");
-    assert!(leaked.is_empty(), "POST followed to another origin: {leaked:?}");
+    assert!(
+        leaked.is_empty(),
+        "POST followed to another origin: {leaked:?}"
+    );
 }
 
 #[test]
@@ -205,9 +257,14 @@ fn auth_at_a_redirected_origin_never_calls_the_callback() {
     register_once();
     let fx = fixture();
     seed("xa.git");
-    let err = clone(&fx.url("xauth/xa.git")).err().expect("401 at another origin must fail");
+    let err = clone(&fx.url("xauth/xa.git"))
+        .err()
+        .expect("401 at another origin must fail");
     assert!(err.message().contains("origin"), "got: {err}");
     let there = fx.seen("/private/xa.git");
     assert!(!there.is_empty(), "redirect target never reached");
-    assert!(there.iter().all(|s| !s.authorization), "credentials sent to another origin: {there:?}");
+    assert!(
+        there.iter().all(|s| !s.authorization),
+        "credentials sent to another origin: {there:?}"
+    );
 }
