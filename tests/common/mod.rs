@@ -28,6 +28,19 @@ struct Shared {
     root: PathBuf,
     user_agents: Mutex<Vec<String>>,
     unauthorized: AtomicUsize,
+    seen: Mutex<Vec<Seen>>,
+    port: u16,
+}
+
+/// What the server saw for one request.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub authorization: bool,
+    pub content_length: bool,
+    pub chunked: bool,
 }
 
 pub struct Fixture {
@@ -43,7 +56,10 @@ static REGISTER: Once = Once::new();
 /// The process-wide fixture; starts the HTTPS server on first use.
 pub fn fixture() -> &'static Fixture {
     FIXTURE.get_or_init(|| {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+        ])
             .expect("self-signed cert");
         let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
         let server_config = Arc::new(
@@ -64,6 +80,8 @@ pub fn fixture() -> &'static Fixture {
             root: root_dir.path().to_path_buf(),
             user_agents: Mutex::new(Vec::new()),
             unauthorized: AtomicUsize::new(0),
+            seen: Mutex::new(Vec::new()),
+            port,
         });
 
         let accept_shared = Arc::clone(&shared);
@@ -114,19 +132,33 @@ impl Fixture {
     pub fn unauthorized_count(&self) -> usize {
         self.shared.unauthorized.load(Ordering::SeqCst)
     }
+
+    /// Requests whose path starts with `prefix`.
+    pub fn seen(&self, prefix: &str) -> Vec<Seen> {
+        self.shared
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.path.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
 }
 
 /// Registers the transport once per process. The callback supplies credentials
 /// only for the test paths that need them.
 pub fn register_once() {
     REGISTER.call_once(|| {
-        git2_rustls_transport::register(fixture().client(), callback)
+        // SAFETY: `Once` serialises registration, and no test creates a
+        // transport before `register_once` returns.
+        unsafe { git2_rustls_transport::register(fixture().client(), callback) }
             .expect("register https transport");
     });
 }
 
 fn callback(url: &str) -> Option<Credentials> {
-    let password = if url.contains("/private/") {
+    let password = if url.contains("/private/") || url.contains("/xhost/") {
         PASSWORD
     } else if url.contains("/badauth/") {
         "wrong"
@@ -349,9 +381,41 @@ fn route(request: &Req, shared: &Shared) -> Reply {
         .unwrap()
         .push(request.header("User-Agent").unwrap_or_default().to_owned());
 
+    shared.seen.lock().unwrap().push(Seen {
+        method: request.method.clone(),
+        host: request.header("Host").unwrap_or_default().to_owned(),
+        path: request.path.clone(),
+        authorization: request.header("Authorization").is_some(),
+        content_length: request.header("Content-Length").is_some(),
+        chunked: request.header("Transfer-Encoding").is_some(),
+    });
+
     let path = request.path.as_str();
     let query = request.query.as_str();
     let is_post = request.method == "POST";
+    let with_query = |rest: &str| {
+        if query.is_empty() {
+            rest.to_owned()
+        } else {
+            format!("{rest}?{query}")
+        }
+    };
+
+    // /xhost/<repo>: needs auth, then redirects info/refs to another host
+    // (127.0.0.1 instead of localhost) under /leak, which needs no auth.
+    if let Some(rest) = path.strip_prefix("/xhost") {
+        if request.header("Authorization") != Some(expected_auth().as_str()) {
+            shared.unauthorized.fetch_add(1, Ordering::SeqCst);
+            return Reply::new(401, Vec::new()).with("WWW-Authenticate", "Basic realm=\"git\"");
+        }
+        let location = format!("https://127.0.0.1:{}/leak{}", shared.port, with_query(rest));
+        return redirect(301, &location);
+    }
+    // /tohttp/<repo>: redirects info/refs to plain http.
+    if let Some(rest) = path.strip_prefix("/tohttp") {
+        let location = format!("http://localhost:{}{}", shared.port, with_query(rest));
+        return redirect(301, &location);
+    }
 
     // /old/<repo>: permanent redirect to the real repo (info/refs is followed).
     if let Some(rest) = path.strip_prefix("/old") {
@@ -363,7 +427,9 @@ fn route(request: &Req, shared: &Shared) -> Reply {
         return redirect(301, &location);
     }
 
-    let (path_info, user) = if let Some(rest) = path.strip_prefix("/redir") {
+    let (path_info, user) = if let Some(rest) = path.strip_prefix("/leak") {
+        (rest.to_owned(), None)
+    } else if let Some(rest) = path.strip_prefix("/redir") {
         // POSTs are redirected (the client must refuse them); GETs are served.
         if is_post {
             return redirect(307, rest);

@@ -12,8 +12,13 @@
 //! let client = reqwest::blocking::Client::builder()
 //!     // Redirects are handled by this crate for info/refs only.
 //!     .redirect(reqwest::redirect::Policy::none())
+//!     // The blocking client's default 30 s total timeout would cut off large
+//!     // clones, so bound only the connect.
+//!     .timeout(None)
+//!     .connect_timeout(std::time::Duration::from_secs(30))
 //!     .build()?;
-//! git2_rustls_transport::register(client, |_url| None)?;
+//! // SAFETY: called once at start-up, before any git2 operation.
+//! unsafe { git2_rustls_transport::register(client, |_url| None)? };
 //! git2::Repository::clone("https://github.com/octocat/Hello-World.git", "hello")?;
 //! # Ok(())
 //! # }
@@ -50,16 +55,29 @@ impl fmt::Debug for Credentials {
 /// returns `None` to give up. Credentials that succeed are cached for the
 /// remote's later requests (the POST that follows info/refs).
 ///
+/// Credentials in the remote URL (`https://user:token@host/repo`) are used
+/// first. libgit2's `RemoteCallbacks::credentials` is never consulted; only
+/// `credentials` here is.
+///
 /// libgit2's transport registry is process-global, so call this once at
 /// start-up. A second call returns an error from libgit2.
-pub fn register<F>(client: reqwest::blocking::Client, credentials: F) -> Result<(), git2::Error>
+///
+/// # Safety
+///
+/// This wraps [`git2::transport::register`], which is not synchronised with
+/// transport creation. The caller must ensure that no other thread creates a
+/// git2 transport (clone, fetch, push, `Remote::connect`, ...) or registers a
+/// transport while this runs, for example by calling it at start-up before
+/// any other git2 use.
+pub unsafe fn register<F>(
+    client: reqwest::blocking::Client,
+    credentials: F,
+) -> Result<(), git2::Error>
 where
     F: Fn(&str) -> Option<Credentials> + Send + Sync + 'static,
 {
     let callback: Arc<CredentialCallback> = Arc::new(credentials);
-    // SAFETY: git2 documents this function as requiring external
-    // synchronisation with other transport creation. The caller contract above
-    // (register once, at start-up) provides that.
+    // SAFETY: the caller upholds the synchronisation contract above.
     unsafe {
         git2::transport::register("https", move |remote| {
             let subtransport = Subtransport::new(client.clone(), Arc::clone(&callback));

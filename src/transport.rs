@@ -2,13 +2,13 @@
 //! 401 credential retry.
 
 use std::io::{self, Read, Write};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::mem;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
 
 use git2::transport::{Service, SmartSubtransport, SmartSubtransportStream};
 use git2::Error;
-use reqwest::blocking::{Body, Client, Response};
+use percent_encoding::percent_decode_str;
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::{StatusCode, Url};
 
@@ -16,9 +16,6 @@ use crate::Credentials;
 
 const USER_AGENT_VALUE: &str = concat!("git2-rustls-transport/", env!("CARGO_PKG_VERSION"));
 const MAX_REDIRECTS: usize = 5;
-/// Request-body chunks buffered between libgit2 and the HTTP thread. This bounds
-/// memory while a pack is streamed.
-const BODY_QUEUE_DEPTH: usize = 4;
 
 pub(crate) type CredentialCallback = dyn Fn(&str) -> Option<Credentials> + Send + Sync;
 
@@ -50,11 +47,24 @@ impl Subtransport {
         self.state.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn base_for(&self, url: &str) -> String {
-        self.state()
-            .base
-            .clone()
-            .unwrap_or_else(|| url.trim_end_matches('/').to_owned())
+    /// The repository base URL, without userinfo. On first use, credentials in
+    /// the libgit2 URL (`https://user:token@host/repo`) seed `accepted`.
+    fn base_for(&self, url: &str) -> Result<String, Error> {
+        let mut state = self.state();
+        if let Some(base) = &state.base {
+            return Ok(base.clone());
+        }
+        let mut parsed = parse_url(url)?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            if state.accepted.is_none() {
+                state.accepted = Some(Credentials {
+                    username: decode(parsed.username()),
+                    password: decode(parsed.password().unwrap_or("")),
+                });
+            }
+            parsed = without_userinfo(&parsed);
+        }
+        Ok(parsed.as_str().trim_end_matches('/').to_owned())
     }
 
     fn accepted_credentials(&self) -> Option<Credentials> {
@@ -62,7 +72,7 @@ impl Subtransport {
     }
 
     fn advertise(&self, url: &str, service: &str) -> Result<Stream, Error> {
-        let base = self.base_for(url);
+        let base = self.base_for(url)?;
         let mut target = parse_url(&format!("{base}/info/refs?service={service}"))?;
         let mut response = self.get_authenticated(&target)?;
         // Redirects are followed only here. A client built with
@@ -78,20 +88,41 @@ impl Subtransport {
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| Error::from_str("https transport: redirect without Location"))?
                 .to_owned();
-            target = target
+            let next = target
                 .join(&location)
                 .map_err(|e| Error::from_str(&format!("https transport: bad redirect: {e}")))?;
+            self.check_redirect(&target, &next)?;
+            target = next;
             response = self.get_authenticated(&target)?;
         }
         if response.status().is_redirection() {
             return Err(Error::from_str("https transport: too many redirects"));
         }
+        // A client that follows redirects itself may have ended elsewhere.
+        let final_url = response.url().clone();
+        self.check_redirect(&target, &final_url)?;
         if !response.status().is_success() {
             return Err(Error::from_str(&http_error(response.status(), &target)));
         }
         require_content_type(&response, &format!("application/x-{service}-advertisement"))?;
         self.state().base = Some(base_from_info_refs(response.url())?);
         Ok(Stream::Advertisement(response))
+    }
+
+    /// Refuses a redirect off https, and forgets accepted credentials when the
+    /// redirect leaves the origin (scheme, host or port), so they are not sent
+    /// to another server.
+    fn check_redirect(&self, from: &Url, to: &Url) -> Result<(), Error> {
+        if to.scheme() != "https" {
+            return Err(Error::from_str(&format!(
+                "https transport: redirect to non-https URL {} refused",
+                redact(to)
+            )));
+        }
+        if to.origin() != from.origin() {
+            self.state().accepted = None;
+        }
+        Ok(())
     }
 
     fn get_authenticated(&self, url: &Url) -> Result<Response, Error> {
@@ -121,41 +152,24 @@ impl Subtransport {
     }
 
     fn rpc(&self, url: &str, service: &str) -> Result<Stream, Error> {
-        let target = parse_url(&format!("{}/{service}", self.base_for(url)))?;
-        let (body_tx, body_rx) = mpsc::sync_channel::<Vec<u8>>(BODY_QUEUE_DEPTH);
-        let (reply_tx, reply_rx) = mpsc::channel();
+        let target = parse_url(&format!("{}/{service}", self.base_for(url)?))?;
+        let mut request = self
+            .client
+            .post(target.clone())
+            .header(USER_AGENT, USER_AGENT_VALUE)
+            .header(CONTENT_TYPE, format!("application/x-{service}-request"))
+            .header(ACCEPT, format!("application/x-{service}-result"));
+        if let Some(c) = self.accepted_credentials() {
+            request = request.basic_auth(c.username, Some(c.password));
+        }
 
-        // The request runs on its own thread so that libgit2's writes stream
-        // into the body while the POST is in flight.
-        let client = self.client.clone();
-        let request_url = target.clone();
-        let credentials = self.accepted_credentials();
-        let request_type = format!("application/x-{service}-request");
-        let accept_type = format!("application/x-{service}-result");
-        thread::Builder::new()
-            .name(format!("{service}-post"))
-            .spawn(move || {
-                let mut request = client
-                    .post(request_url)
-                    .header(USER_AGENT, USER_AGENT_VALUE)
-                    .header(CONTENT_TYPE, request_type)
-                    .header(ACCEPT, accept_type)
-                    .body(Body::new(QueueReader::new(body_rx)));
-                if let Some(c) = credentials {
-                    request = request.basic_auth(c.username, Some(c.password));
-                }
-                // The receiver is gone only when the transfer was abandoned.
-                let _ = reply_tx.send(request.send());
-            })
-            .map_err(|e| Error::from_str(&format!("https transport: thread spawn: {e}")))?;
-
-        Ok(Stream::Rpc(RpcStream {
-            body: Some(body_tx),
-            reply: reply_rx,
+        Ok(Stream::Rpc(Box::new(RpcStream {
+            request: Some(request),
+            body: Vec::new(),
             response: None,
             target,
             result_type: format!("application/x-{service}-result"),
-        }))
+        })))
     }
 }
 
@@ -184,7 +198,7 @@ pub(crate) enum Stream {
     /// info/refs body, read-only.
     Advertisement(Response),
     /// POST: request body written by libgit2, reply read back.
-    Rpc(RpcStream),
+    Rpc(Box<RpcStream>),
 }
 
 impl Read for Stream {
@@ -212,9 +226,13 @@ impl Write for Stream {
     }
 }
 
+/// The request body is buffered and sent with a `Content-Length` on the first
+/// read. A stateless-RPC body is one negotiation round or one pack, so it is
+/// bounded by the pack size.
 pub(crate) struct RpcStream {
-    body: Option<SyncSender<Vec<u8>>>,
-    reply: Receiver<reqwest::Result<Response>>,
+    /// The POST, until it is sent.
+    request: Option<RequestBuilder>,
+    body: Vec<u8>,
     response: Option<Response>,
     target: Url,
     result_type: String,
@@ -222,18 +240,13 @@ pub(crate) struct RpcStream {
 
 impl Write for RpcStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let body = self.body.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "request body already sent")
-        })?;
-        body.send(buf.to_vec()).map_err(|_| {
-            io::Error::new(
+        if self.request.is_none() {
+            return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "server closed the connection while the request was being sent",
-            )
-        })?;
+                "request body already sent",
+            ));
+        }
+        self.body.extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -245,12 +258,13 @@ impl Write for RpcStream {
 impl Read for RpcStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.response.is_none() {
-            // Reading means the request is complete: closing the sender ends the body.
-            self.body = None;
-            let response = self
-                .reply
-                .recv()
-                .map_err(|_| io::Error::other("https transport: request thread ended early"))?
+            // Reading means the request body is complete: send it.
+            let request = self.request.take().ok_or_else(|| {
+                io::Error::other("https transport: request already failed")
+            })?;
+            let response = request
+                .body(mem::take(&mut self.body))
+                .send()
                 .map_err(io::Error::other)?;
             if response.url() != &self.target || response.status().is_redirection() {
                 return Err(io::Error::other(
@@ -270,44 +284,40 @@ impl Read for RpcStream {
     }
 }
 
-/// Adapts the bounded channel to `Read` so reqwest can stream the body.
-struct QueueReader {
-    rx: Receiver<Vec<u8>>,
-    current: Vec<u8>,
-    pos: usize,
-}
-
-impl QueueReader {
-    fn new(rx: Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx,
-            current: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl Read for QueueReader {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        while self.pos >= self.current.len() {
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.current = chunk;
-                    self.pos = 0;
-                }
-                // Sender dropped: end of request body.
-                Err(_) => return Ok(0),
-            }
-        }
-        let n = out.len().min(self.current.len() - self.pos);
-        out[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
-    }
-}
-
 fn parse_url(raw: &str) -> Result<Url, Error> {
-    Url::parse(raw).map_err(|e| Error::from_str(&format!("https transport: bad URL {raw}: {e}")))
+    Url::parse(raw).map_err(|e| {
+        Error::from_str(&format!("https transport: bad URL {}: {e}", redact_raw(raw)))
+    })
+}
+
+fn without_userinfo(url: &Url) -> Url {
+    let mut clean = url.clone();
+    // These fail only for URLs that cannot carry userinfo, so have none.
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean
+}
+
+/// The URL for error messages, never with credentials in it.
+fn redact(url: &Url) -> String {
+    without_userinfo(url).to_string()
+}
+
+/// `redact` for text that did not parse as a URL: drops the authority up to
+/// its last `@`.
+fn redact_raw(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return raw.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => raw.to_owned(),
+    }
+}
+
+fn decode(component: &str) -> String {
+    percent_decode_str(component).decode_utf8_lossy().into_owned()
 }
 
 /// Strips `/info/refs` (and its query) to get the repository base URL.
@@ -343,9 +353,30 @@ fn check_content_type(response: &Response, expected: &str) -> Result<(), String>
 }
 
 fn http_error(status: StatusCode, url: &Url) -> String {
-    format!("https transport: HTTP {status} from {url}")
+    format!("https transport: HTTP {status} from {}", redact(url))
 }
 
 fn network_error(error: reqwest::Error) -> Error {
     Error::from_str(&format!("https transport: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_error_redacts_userinfo() {
+        let url = Url::parse("https://alice:hunter2@example.com/repo.git/info/refs").unwrap();
+        let text = http_error(StatusCode::NOT_FOUND, &url);
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(!text.contains("alice"), "{text}");
+        assert!(text.contains("example.com/repo.git/info/refs"), "{text}");
+    }
+
+    #[test]
+    fn parse_url_error_redacts_userinfo() {
+        let err = parse_url("https://alice:hunter2@exa mple.com/repo.git").unwrap_err();
+        assert!(!err.message().contains("hunter2"), "{}", err.message());
+        assert!(err.message().contains("bad URL"), "{}", err.message());
+    }
 }

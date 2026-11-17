@@ -2,15 +2,18 @@
 name = "git2-rustls-transport"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "git2 smart-HTTP transport for libgit2 over blocking reqwest + rustls (no OpenSSL)"
 repository = "https://github.com/Satwik-Miyyapuram/git2-rustls-transport"
 readme = "README.md"
 keywords = ["git", "libgit2", "rustls", "android", "transport"]
-categories = ["development-tools"]
+categories = ["development-tools", "network-programming"]
+include = ["src/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE-*", "Cargo.toml"]
 
 [dependencies]
 git2 = { version = "0.21", default-features = false }
+percent-encoding = "2"
 reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
 
 [dev-dependencies]
