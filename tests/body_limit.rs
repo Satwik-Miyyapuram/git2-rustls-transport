@@ -3,21 +3,19 @@
 
 mod common;
 
-use common::{fixture, git, register_once_with_limits, seed};
+use common::{fixture, git, register_once_with_limits, seed, TestResult};
 use git2::build::RepoBuilder;
 
 const LIMIT: usize = 4096;
 
 #[test]
-fn push_over_the_body_limit_fails_clearly() {
-    register_once_with_limits(git2_rustls_transport::Limits::default().max_request_body(LIMIT));
-    let fx = fixture();
-    seed("limit.git");
-    let dir = tempfile::tempdir().expect("temp clone dir");
+fn push_over_the_body_limit_fails_clearly() -> TestResult {
+    register_once_with_limits(git2_rustls_transport::Limits::default().max_request_body(LIMIT))?;
+    let fx = fixture()?;
+    seed("limit.git")?;
+    let dir = tempfile::tempdir()?;
     // A clone's POST bodies (want/have lines) fit well under the cap.
-    let repo = RepoBuilder::new()
-        .clone(&fx.url("limit.git"), dir.path())
-        .expect("clone under the limit");
+    let repo = RepoBuilder::new().clone(&fx.url("limit.git"), dir.path())?;
 
     // 64 KiB of pseudo-random bytes do not compress, so the pack is far over 4 KiB.
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -29,8 +27,8 @@ fn push_over_the_body_limit_fails_clearly() {
             x as u8
         })
         .collect();
-    std::fs::write(dir.path().join("noise.bin"), noise).expect("write noise");
-    git(dir.path(), &["add", "noise.bin"]);
+    std::fs::write(dir.path().join("noise.bin"), noise)?;
+    git(dir.path(), &["add", "noise.bin"])?;
     git(
         dir.path(),
         &[
@@ -43,13 +41,14 @@ fn push_over_the_body_limit_fails_clearly() {
             "-m",
             "noise",
         ],
-    );
+    )?;
 
-    let err = repo
-        .find_remote("origin")
-        .unwrap()
+    let Err(err) = repo
+        .find_remote("origin")?
         .push(&["refs/heads/main:refs/heads/main"], None)
-        .expect_err("push over the limit must fail");
+    else {
+        return Err("push over the limit must fail".into());
+    };
     assert!(err.message().contains("4096-byte limit"), "got: {err}");
     let posts: Vec<_> = fx
         .seen("/limit.git/git-receive-pack")
@@ -57,4 +56,5 @@ fn push_over_the_body_limit_fails_clearly() {
         .filter(|s| s.method == "POST")
         .collect();
     assert!(posts.is_empty(), "an over-limit body was sent: {posts:?}");
+    Ok(())
 }

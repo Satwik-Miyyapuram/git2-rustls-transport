@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.1
+
+- Test code is clippy-clean under `-D warnings -D clippy::unwrap_used
+  -D clippy::expect_used -D clippy::panic`: tests and the fixture helpers
+  return `Result` and use `?` instead of `unwrap`/`expect`/`panic`.
+- No change to the transport's public API or runtime behaviour.
+
 ## 0.1.0
 
 - First release. Registers a `https` smart transport for libgit2 (via `git2`

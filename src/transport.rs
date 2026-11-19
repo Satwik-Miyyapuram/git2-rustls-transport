@@ -467,71 +467,83 @@ fn network_error(mut error: reqwest::Error) -> Error {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn http_error_redacts_userinfo() {
-        let url = Url::parse("https://alice:hunter2@example.com/repo.git/info/refs").unwrap();
+    fn http_error_redacts_userinfo() -> TestResult {
+        let url = Url::parse("https://alice:hunter2@example.com/repo.git/info/refs")?;
         let text = http_error(StatusCode::NOT_FOUND, &url);
         assert!(!text.contains("hunter2"), "{text}");
         assert!(!text.contains("alice"), "{text}");
         assert!(text.contains("example.com/repo.git/info/refs"), "{text}");
+        Ok(())
     }
 
     #[test]
-    fn parse_url_error_redacts_userinfo() {
-        let err = parse_url("https://alice:hunter2@exa mple.com/repo.git").unwrap_err();
+    fn parse_url_error_redacts_userinfo() -> TestResult {
+        let Err(err) = parse_url("https://alice:hunter2@exa mple.com/repo.git") else {
+            return Err("parse_url must reject a malformed URL".into());
+        };
         assert!(!err.message().contains("hunter2"), "{}", err.message());
         assert!(err.message().contains("bad URL"), "{}", err.message());
+        Ok(())
     }
 
     #[test]
-    fn parse_url_error_redacts_password_with_slash() {
-        let err = parse_url("https://alice:pa/ss@example.com/repo.git").unwrap_err();
+    fn parse_url_error_redacts_password_with_slash() -> TestResult {
+        let Err(err) = parse_url("https://alice:pa/ss@example.com/repo.git") else {
+            return Err("parse_url must reject a password containing '/'".into());
+        };
         assert!(!err.message().contains("pa/ss"), "{}", err.message());
         assert!(!err.message().contains("alice"), "{}", err.message());
+        Ok(())
     }
 
     #[test]
-    fn non_utf8_userinfo_is_an_error() {
+    fn non_utf8_userinfo_is_an_error() -> TestResult {
         let sub = Subtransport::new(Client::new(), Arc::new(|_: &str| None), Limits::default());
-        let err = sub
-            .base_for("https://alice:%FF@example.com/repo.git")
-            .unwrap_err();
+        let Err(err) = sub.base_for("https://alice:%FF@example.com/repo.git") else {
+            return Err("non-UTF-8 userinfo must be refused".into());
+        };
         assert!(err.message().contains("UTF-8"), "{}", err.message());
         assert!(sub.state().accepted.is_none());
+        Ok(())
     }
 
     #[test]
-    fn network_error_redacts_userinfo() {
-        let client = Client::builder().https_only(true).build().unwrap();
-        let error = client
+    fn network_error_redacts_userinfo() -> TestResult {
+        let client = Client::builder().https_only(true).build()?;
+        let Err(error) = client
             .get("http://alice:hunter2@127.0.0.1:1/repo.git")
             .send()
-            .unwrap_err();
+        else {
+            return Err("nothing listens on port 1; the request must fail".into());
+        };
         assert!(error.url().is_some(), "error carries no URL: {error}");
         let text = network_error(error).message().to_owned();
         assert!(!text.contains("hunter2"), "{text}");
         assert!(!text.contains("alice"), "{text}");
+        Ok(())
     }
 
     /// Serves one canned reply per connection, recording whether each request
-    /// carried an Authorization header.
-    fn serve(replies: Vec<&'static str>) -> (Url, std::thread::JoinHandle<Vec<bool>>) {
+    /// carried an Authorization header. The thread's result is the record.
+    fn serve(
+        replies: Vec<&'static str>,
+    ) -> io::Result<(Url, std::thread::JoinHandle<io::Result<Vec<bool>>>)> {
         use std::io::{BufRead, BufReader};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = Url::parse(&format!(
-            "http://{}/repo.git",
-            listener.local_addr().unwrap()
-        ))
-        .unwrap();
-        let handle = std::thread::spawn(move || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = Url::parse(&format!("http://{}/repo.git", listener.local_addr()?))
+            .map_err(io::Error::other)?;
+        let handle = std::thread::spawn(move || -> io::Result<Vec<bool>> {
             let mut auth = Vec::new();
             for reply in replies {
-                let (mut tcp, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(tcp.try_clone().unwrap());
+                let (mut tcp, _) = listener.accept()?;
+                let mut reader = BufReader::new(tcp.try_clone()?);
                 let mut seen = false;
                 loop {
                     let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
+                    reader.read_line(&mut line)?;
                     if line.trim().is_empty() {
                         break;
                     }
@@ -540,32 +552,34 @@ mod tests {
                 auth.push(seen);
                 let head =
                     format!("HTTP/1.1 {reply}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                tcp.write_all(head.as_bytes()).unwrap();
+                tcp.write_all(head.as_bytes())?;
             }
-            auth
+            Ok(auth)
         });
-        (url, handle)
+        Ok((url, handle))
     }
 
     #[test]
-    fn credentials_refused_with_403_are_not_kept() {
-        let (url, server) = serve(vec!["401 Unauthorized", "403 Forbidden", "200 OK"]);
+    fn credentials_refused_with_403_are_not_kept() -> TestResult {
+        let (url, server) = serve(vec!["401 Unauthorized", "403 Forbidden", "200 OK"])?;
         let callback = |_: &str| {
             Some(Credentials {
                 username: "alice".to_owned(),
                 password: "hunter2".to_owned(),
             })
         };
-        let client = Client::builder().no_proxy().build().unwrap();
+        let client = Client::builder().no_proxy().build()?;
         let sub = Subtransport::new(client, Arc::new(callback), Limits::default());
-        sub.base_for(url.as_str()).unwrap();
-        let response = sub.get_authenticated(&url).unwrap();
+        sub.base_for(url.as_str())?;
+        let response = sub.get_authenticated(&url)?;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(sub.state().accepted.is_none());
         // The next request goes out without them.
-        let next = sub.get(&url, sub.credentials_for(&url).as_ref()).unwrap();
+        let next = sub.get(&url, sub.credentials_for(&url).as_ref())?;
         assert_eq!(next.status(), StatusCode::OK);
-        assert_eq!(server.join().unwrap(), vec![false, true, false]);
+        let seen = server.join().map_err(|_| "server thread panicked")??;
+        assert_eq!(seen, vec![false, true, false]);
+        Ok(())
     }
 
     fn advertisement(body: &[u8], limit: usize) -> io::Result<Vec<u8>> {
@@ -579,13 +593,17 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_exactly_at_the_limit_is_accepted() {
-        assert_eq!(advertisement(b"0123456789", 10).unwrap(), b"0123456789");
+    fn advertisement_exactly_at_the_limit_is_accepted() -> TestResult {
+        assert_eq!(advertisement(b"0123456789", 10)?, b"0123456789");
+        Ok(())
     }
 
     #[test]
-    fn advertisement_one_byte_over_the_limit_is_refused() {
-        let err = advertisement(b"0123456789a", 10).unwrap_err();
+    fn advertisement_one_byte_over_the_limit_is_refused() -> TestResult {
+        let Err(err) = advertisement(b"0123456789a", 10) else {
+            return Err("an advertisement over the limit must be refused".into());
+        };
         assert!(err.to_string().contains("10-byte limit"), "{err}");
+        Ok(())
     }
 }
