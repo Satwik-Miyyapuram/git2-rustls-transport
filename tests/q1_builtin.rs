@@ -6,18 +6,18 @@
 
 mod common;
 
-use common::{fixture, seed, UA_PREFIX};
+use common::{fixture, seed, TestResult, UA_PREFIX};
 use git2::build::RepoBuilder;
 
 #[test]
-fn builtin_https_is_used_when_nothing_is_registered() {
-    let fx = fixture();
-    seed("builtin.git");
-    let dir = tempfile::tempdir().unwrap();
-    let err = RepoBuilder::new()
-        .clone(&fx.url("builtin.git"), dir.path())
-        .err()
-        .expect("WinHTTP must reject the self-signed certificate");
+fn builtin_https_is_used_when_nothing_is_registered() -> TestResult {
+    let fx = fixture()?;
+    seed("builtin.git")?;
+    let dir = tempfile::tempdir()?;
+    let Err(err) = RepoBuilder::new().clone(&fx.url("builtin.git"), dir.path()) else {
+        return Err("WinHTTP must reject the self-signed certificate".into());
+    };
     eprintln!("builtin clone error: {err}");
     assert!(fx.user_agents().iter().all(|ua| !ua.starts_with(UA_PREFIX)));
+    Ok(())
 }

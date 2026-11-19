@@ -4,22 +4,21 @@
 
 mod common;
 
-use common::{fixture, register_once, seed, UA_PREFIX};
+use common::{fixture, register_once, seed, TestResult, UA_PREFIX};
 use git2::build::RepoBuilder;
 
 #[test]
-fn registered_https_prefix_overrides_builtin_transport() {
-    register_once();
-    let fx = fixture();
-    seed("q1.git");
-    let dir = tempfile::tempdir().unwrap();
-    RepoBuilder::new()
-        .clone(&fx.url("q1.git"), dir.path())
-        .expect("clone via registered transport");
+fn registered_https_prefix_overrides_builtin_transport() -> TestResult {
+    register_once()?;
+    let fx = fixture()?;
+    seed("q1.git")?;
+    let dir = tempfile::tempdir()?;
+    RepoBuilder::new().clone(&fx.url("q1.git"), dir.path())?;
     let agents = fx.user_agents();
     assert!(!agents.is_empty(), "server saw no requests");
     assert!(
         agents.iter().all(|ua| ua.starts_with(UA_PREFIX)),
         "some request bypassed the registered transport: {agents:?}"
     );
+    Ok(())
 }

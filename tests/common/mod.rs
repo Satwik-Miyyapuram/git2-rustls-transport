@@ -6,12 +6,13 @@
 
 #![allow(dead_code)]
 
+use std::error::Error;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -22,6 +23,9 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 pub const USER: &str = "alice";
 pub const PASSWORD: &str = "s3cret";
 pub const UA_PREFIX: &str = "git2-rustls-transport/";
+
+/// Return type of every test and fallible helper.
+pub type TestResult = Result<(), Box<dyn Error>>;
 
 /// State the request handlers share with the tests.
 struct Shared {
@@ -52,62 +56,63 @@ pub struct Fixture {
     _root_dir: tempfile::TempDir,
 }
 
-static FIXTURE: OnceLock<Fixture> = OnceLock::new();
-static REGISTER: Once = Once::new();
+/// The fixture, or the message of the error that stopped its startup.
+static FIXTURE: OnceLock<Result<Fixture, String>> = OnceLock::new();
+/// The outcome of the one `register` call, kept as its message on error.
+static REGISTER: OnceLock<Result<(), String>> = OnceLock::new();
 
 /// The process-wide fixture; starts the HTTPS server on first use.
-pub fn fixture() -> &'static Fixture {
-    FIXTURE.get_or_init(|| {
-        let cert = rcgen::generate_simple_self_signed(vec![
-            "localhost".to_owned(),
-            "127.0.0.1".to_owned(),
-        ])
-        .expect("self-signed cert");
-        let key_der =
-            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let server_config = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::aws_lc_rs::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("protocol versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.cert.der().clone()], key_der)
-            .expect("server cert"),
-        );
+pub fn fixture() -> Result<&'static Fixture, Box<dyn Error>> {
+    FIXTURE
+        .get_or_init(|| start_fixture().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|message| Box::<dyn Error>::from(message.as_str()))
+}
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("local addr").port();
-        let alt_listener = TcpListener::bind("127.0.0.1:0").expect("bind alt");
-        let alt_port = alt_listener.local_addr().expect("alt local addr").port();
-        let root_dir = tempfile::tempdir().expect("temp root");
-        let shared = Arc::new(Shared {
-            root: root_dir.path().to_path_buf(),
-            user_agents: Mutex::new(Vec::new()),
-            unauthorized: AtomicUsize::new(0),
-            seen: Mutex::new(Vec::new()),
-            port,
-            alt_port,
+fn start_fixture() -> Result<Fixture, Box<dyn Error>> {
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])?;
+    let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
+    let server_config = Arc::new(
+        ServerConfig::builder_with_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key_der)?,
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let alt_listener = TcpListener::bind("127.0.0.1:0")?;
+    let alt_port = alt_listener.local_addr()?.port();
+    let root_dir = tempfile::tempdir()?;
+    let shared = Arc::new(Shared {
+        root: root_dir.path().to_path_buf(),
+        user_agents: Mutex::new(Vec::new()),
+        unauthorized: AtomicUsize::new(0),
+        seen: Mutex::new(Vec::new()),
+        port,
+        alt_port,
+    });
+
+    for listener in [listener, alt_listener] {
+        let accept_shared = Arc::clone(&shared);
+        let server_config = Arc::clone(&server_config);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let config = Arc::clone(&server_config);
+                let shared = Arc::clone(&accept_shared);
+                thread::spawn(move || serve_connection(stream, config, &shared));
+            }
         });
+    }
 
-        for listener in [listener, alt_listener] {
-            let accept_shared = Arc::clone(&shared);
-            let server_config = Arc::clone(&server_config);
-            thread::spawn(move || {
-                for stream in listener.incoming().flatten() {
-                    let config = Arc::clone(&server_config);
-                    let shared = Arc::clone(&accept_shared);
-                    thread::spawn(move || serve_connection(stream, config, &shared));
-                }
-            });
-        }
-
-        Fixture {
-            origin: format!("https://localhost:{port}"),
-            cert_pem: cert.cert.pem(),
-            shared,
-            _root_dir: root_dir,
-        }
+    Ok(Fixture {
+        origin: format!("https://localhost:{port}"),
+        cert_pem: cert.cert.pem(),
+        shared,
+        _root_dir: root_dir,
     })
 }
 
@@ -119,10 +124,9 @@ impl Fixture {
     /// A client builder that trusts the self-signed certificate. It keeps
     /// reqwest's default (following) redirect policy, so the tests show that
     /// the transport overrides it.
-    pub fn builder(&self) -> reqwest::blocking::ClientBuilder {
-        reqwest::blocking::Client::builder().add_root_certificate(
-            reqwest::Certificate::from_pem(self.cert_pem.as_bytes()).expect("cert pem"),
-        )
+    pub fn builder(&self) -> Result<reqwest::blocking::ClientBuilder, Box<dyn Error>> {
+        let cert = reqwest::Certificate::from_pem(self.cert_pem.as_bytes())?;
+        Ok(reqwest::blocking::Client::builder().add_root_certificate(cert))
     }
 
     pub fn root(&self) -> &Path {
@@ -130,7 +134,7 @@ impl Fixture {
     }
 
     pub fn user_agents(&self) -> Vec<String> {
-        self.shared.user_agents.lock().unwrap().clone()
+        locked(&self.shared.user_agents).clone()
     }
 
     pub fn unauthorized_count(&self) -> usize {
@@ -139,10 +143,7 @@ impl Fixture {
 
     /// Requests whose path starts with `prefix`.
     pub fn seen(&self, prefix: &str) -> Vec<Seen> {
-        self.shared
-            .seen
-            .lock()
-            .unwrap()
+        locked(&self.shared.seen)
             .iter()
             .filter(|s| s.path.starts_with(prefix))
             .cloned()
@@ -152,19 +153,33 @@ impl Fixture {
 
 /// Registers the transport once per process. The callback supplies credentials
 /// only for the test paths that need them.
-pub fn register_once() {
-    register_once_with_limits(git2_rustls_transport::Limits::default());
+pub fn register_once() -> TestResult {
+    register_once_with_limits(git2_rustls_transport::Limits::default())
 }
 
 /// `register_once` with custom size caps. Registration is process-global, so
 /// a test binary uses one set of limits for all its tests.
-pub fn register_once_with_limits(limits: git2_rustls_transport::Limits) {
-    REGISTER.call_once(|| {
-        // SAFETY: `Once` serialises registration, and no test creates a
+pub fn register_once_with_limits(limits: git2_rustls_transport::Limits) -> TestResult {
+    let outcome = REGISTER.get_or_init(|| {
+        let builder = fixture()
+            .map_err(|e| e.to_string())?
+            .builder()
+            .map_err(|e| e.to_string())?;
+        // SAFETY: `OnceLock` runs this closure once, and no test creates a
         // transport before `register_once` returns.
-        unsafe { git2_rustls_transport::register(fixture().builder(), limits, callback) }
-            .expect("register https transport");
+        unsafe { git2_rustls_transport::register(builder, limits, callback) }
+            .map_err(|e| e.to_string())
     });
+    outcome
+        .as_ref()
+        .map_err(|message| Box::<dyn Error>::from(message.as_str()))?;
+    Ok(())
+}
+
+/// Locks a fixture mutex. A poisoned lock only means another test thread
+/// panicked, and the data stays usable, so the guard is taken anyway.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn callback(url: &str) -> Option<Credentials> {
@@ -191,23 +206,23 @@ pub struct Seeded {
 
 /// Creates `<root>/<name>` as a bare repo with one commit on `main`, plus a
 /// working copy whose `origin` is that bare repo.
-pub fn seed(name: &str) -> Seeded {
-    let root = fixture().root().to_path_buf();
+pub fn seed(name: &str) -> Result<Seeded, Box<dyn Error>> {
+    let root = fixture()?.root().to_path_buf();
     let bare = root.join(name);
     let work = root.join(format!("{name}.work"));
-    git(&root, &["init", "-q", "--bare", path_str(&bare)]);
-    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    git(&root, &["init", "-q", path_str(&work)]);
-    git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    git(&work, &["remote", "add", "origin", path_str(&bare)]);
-    commit_file(&work, "README.md", "hello\n", "init");
-    git(&work, &["push", "-q", "origin", "main"]);
-    Seeded { bare, work }
+    git(&root, &["init", "-q", "--bare", path_str(&bare)?])?;
+    git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    git(&root, &["init", "-q", path_str(&work)?])?;
+    git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    git(&work, &["remote", "add", "origin", path_str(&bare)?])?;
+    commit_file(&work, "README.md", "hello\n", "init")?;
+    git(&work, &["push", "-q", "origin", "main"])?;
+    Ok(Seeded { bare, work })
 }
 
-pub fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {
-    std::fs::write(dir.join(file), content).expect("write file");
-    git(dir, &["add", file]);
+pub fn commit_file(dir: &Path, file: &str, content: &str, message: &str) -> TestResult {
+    std::fs::write(dir.join(file), content)?;
+    git(dir, &["add", file])?;
     git(
         dir,
         &[
@@ -220,20 +235,19 @@ pub fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {
             "-m",
             message,
         ],
-    );
+    )
 }
 
-pub fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git {args:?} failed in {dir:?}");
+pub fn git(dir: &Path, args: &[&str]) -> TestResult {
+    let status = Command::new("git").current_dir(dir).args(args).status()?;
+    if !status.success() {
+        return Err(format!("git {args:?} failed in {dir:?}").into());
+    }
+    Ok(())
 }
 
-fn path_str(path: &Path) -> &str {
-    path.to_str().expect("utf-8 path")
+fn path_str(path: &Path) -> Result<&str, Box<dyn Error>> {
+    path.to_str().ok_or_else(|| "path is not UTF-8".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -394,13 +408,9 @@ fn redirect(status: u16, location: &str) -> Reply {
 }
 
 fn route(request: &Req, shared: &Shared) -> Reply {
-    shared
-        .user_agents
-        .lock()
-        .unwrap()
-        .push(request.header("User-Agent").unwrap_or_default().to_owned());
+    locked(&shared.user_agents).push(request.header("User-Agent").unwrap_or_default().to_owned());
 
-    shared.seen.lock().unwrap().push(Seen {
+    locked(&shared.seen).push(Seen {
         method: request.method.clone(),
         host: request.header("Host").unwrap_or_default().to_owned(),
         path: request.path.clone(),
@@ -548,6 +558,8 @@ fn route(request: &Req, shared: &Shared) -> Reply {
     )
 }
 
+/// Runs `git http-backend` for one request. A failure to run it becomes a 500
+/// reply, so the client sees an HTTP error and the server thread survives.
 fn run_cgi(
     root: &Path,
     path_info: &str,
@@ -557,6 +569,24 @@ fn run_cgi(
     user: Option<&str>,
     body: &[u8],
 ) -> Reply {
+    match try_run_cgi(root, path_info, method, query, content_type, user, body) {
+        Ok(reply) => reply,
+        Err(err) => {
+            eprintln!("git http-backend bridge failed: {err}");
+            Reply::new(500, Vec::new())
+        }
+    }
+}
+
+fn try_run_cgi(
+    root: &Path,
+    path_info: &str,
+    method: &str,
+    query: &str,
+    content_type: Option<&str>,
+    user: Option<&str>,
+    body: &[u8],
+) -> io::Result<Reply> {
     let mut cmd = Command::new("git");
     cmd.arg("http-backend")
         .env("GIT_PROJECT_ROOT", root)
@@ -577,15 +607,15 @@ fn run_cgi(
     if let Some(u) = user {
         cmd.env("REMOTE_USER", u);
     }
-    let mut child = cmd.spawn().expect("spawn git http-backend");
-    child
+    let mut child = cmd.spawn()?;
+    let mut stdin = child
         .stdin
         .take()
-        .expect("stdin")
-        .write_all(body)
-        .expect("write cgi body");
-    let output = child.wait_with_output().expect("wait for http-backend");
-    parse_cgi(&output.stdout)
+        .ok_or_else(|| io::Error::other("http-backend stdin missing"))?;
+    stdin.write_all(body)?;
+    drop(stdin);
+    let output = child.wait_with_output()?;
+    Ok(parse_cgi(&output.stdout))
 }
 
 /// Turns CGI output (headers, blank line, body) into an HTTP reply.
